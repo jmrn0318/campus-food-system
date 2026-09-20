@@ -1,0 +1,11 @@
+[
+  {
+    "id": "sug-001",
+    "customerName": "marina",
+    "foodName": "Sizzling Pork Chop",
+    "category": "Rice Meals",
+    "reason": "It would be great to have more sizzling options for lunch!",
+    "status": "planned",
+    "createdAt": "2026-09-20T06:00:00.000Z"
+  }
+]

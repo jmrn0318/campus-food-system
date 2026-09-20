@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+.env
+
+# Runtime data (created automatically on first run)
+data/menu.json
+data/orders.json
+data/*.tmp

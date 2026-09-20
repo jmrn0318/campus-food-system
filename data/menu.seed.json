@@ -1,0 +1,178 @@
+[
+  {
+    "id": "chicken-adobo",
+    "name": "Chicken Adobo Rice Meal",
+    "category": "Rice Meals",
+    "emoji": "🍛",
+    "price": 75,
+    "prepMinutes": 8,
+    "available": true,
+    "description": "Tender chicken simmered in soy and vinegar, served with steamed rice.",
+    "imageUrl": "/images/chicken-adobo.jpg"
+  },
+  {
+    "id": "pork-sisig",
+    "name": "Pork Sisig Rice",
+    "category": "Rice Meals",
+    "emoji": "🍚",
+    "price": 85,
+    "prepMinutes": 10,
+    "available": false,
+    "description": "Sizzling chopped pork with onions and calamansi over garlic rice.",
+    "imageUrl": "/images/pork-sisig.jpg"
+  },
+  {
+    "id": "tapsilog",
+    "name": "Tapsilog",
+    "category": "Rice Meals",
+    "emoji": "🍳",
+    "price": 80,
+    "prepMinutes": 8,
+    "available": true,
+    "description": "Beef tapa, garlic fried rice and a sunny-side-up egg.",
+    "imageUrl": "/images/tapsilog.jpg"
+  },
+  {
+    "id": "longsilog",
+    "name": "Longsilog",
+    "category": "Rice Meals",
+    "emoji": "🌭",
+    "price": 70,
+    "prepMinutes": 7,
+    "available": true,
+    "description": "Sweet longganisa with garlic fried rice and a fried egg.",
+    "imageUrl": "/images/longsilog.jpg"
+  },
+  {
+    "id": "fried-chicken",
+    "name": "Fried Chicken with Rice",
+    "category": "Rice Meals",
+    "emoji": "🍗",
+    "price": 79,
+    "prepMinutes": 9,
+    "available": true,
+    "description": "Crispy fried chicken leg with rice and gravy.",
+    "imageUrl": "/images/fried-chicken.jpg"
+  },
+  {
+    "id": "pancit-canton",
+    "name": "Pancit Canton",
+    "category": "Noodles & Snacks",
+    "emoji": "🍜",
+    "price": 45,
+    "prepMinutes": 6,
+    "available": true,
+    "description": "Stir-fried noodles with vegetables and pork.",
+    "imageUrl": "/images/pancit-canton.jpg"
+  },
+  {
+    "id": "spaghetti",
+    "name": "Sweet Spaghetti",
+    "category": "Noodles & Snacks",
+    "emoji": "🍝",
+    "price": 50,
+    "prepMinutes": 5,
+    "available": true,
+    "description": "Filipino-style sweet spaghetti topped with hotdog slices and cheese.",
+    "imageUrl": "/images/spaghetti.jpg"
+  },
+  {
+    "id": "siomai",
+    "name": "Siomai (4 pcs)",
+    "category": "Noodles & Snacks",
+    "emoji": "🥟",
+    "price": 30,
+    "prepMinutes": 4,
+    "available": true,
+    "description": "Steamed pork siomai with soy-calamansi dip.",
+    "imageUrl": "/images/siomai.jpg"
+  },
+  {
+    "id": "lumpia",
+    "name": "Lumpiang Shanghai (5 pcs)",
+    "category": "Noodles & Snacks",
+    "emoji": "🥢",
+    "price": 35,
+    "prepMinutes": 5,
+    "available": true,
+    "description": "Crunchy spring rolls filled with seasoned ground pork.",
+    "imageUrl": "/images/lumpia.jpg"
+  },
+  {
+    "id": "burger",
+    "name": "Burger Sandwich",
+    "category": "Noodles & Snacks",
+    "emoji": "🍔",
+    "price": 40,
+    "prepMinutes": 5,
+    "available": true,
+    "description": "Beef patty, lettuce and sauce in a soft bun.",
+    "imageUrl": "/images/burger.jpg"
+  },
+  {
+    "id": "iced-tea",
+    "name": "Iced Tea",
+    "category": "Drinks",
+    "emoji": "🧋",
+    "price": 25,
+    "prepMinutes": 1,
+    "available": true,
+    "description": "Cold house-blend iced tea, 16 oz.",
+    "imageUrl": "/images/iced-tea.jpg"
+  },
+  {
+    "id": "calamansi-juice",
+    "name": "Calamansi Juice",
+    "category": "Drinks",
+    "emoji": "🍋",
+    "price": 25,
+    "prepMinutes": 2,
+    "available": true,
+    "description": "Freshly squeezed calamansi, lightly sweetened, 16 oz.",
+    "imageUrl": "/images/calamansi-juice.jpg"
+  },
+  {
+    "id": "iced-coffee",
+    "name": "Iced Coffee",
+    "category": "Drinks",
+    "emoji": "☕",
+    "price": 35,
+    "prepMinutes": 2,
+    "available": true,
+    "description": "Cold brew with milk over ice, 16 oz.",
+    "imageUrl": "/images/iced-coffee.jpg"
+  },
+  {
+    "id": "bottled-water",
+    "name": "Bottled Water",
+    "category": "Drinks",
+    "emoji": "💧",
+    "price": 15,
+    "prepMinutes": 1,
+    "available": true,
+    "description": "500 ml purified drinking water.",
+    "imageUrl": "/images/bottled-water.jpg"
+  },
+  {
+    "id": "halo-halo",
+    "name": "Halo-halo",
+    "category": "Desserts",
+    "emoji": "🍧",
+    "price": 55,
+    "prepMinutes": 4,
+    "available": true,
+    "description": "Shaved ice with sweet beans, fruits, leche flan and ube ice cream.",
+    "imageUrl": "/images/halo-halo.jpg"
+  },
+  {
+    "id": "turon",
+    "name": "Turon (2 pcs)",
+    "category": "Desserts",
+    "emoji": "🍌",
+    "price": 20,
+    "prepMinutes": 3,
+    "available": false,
+    "description": "Banana and jackfruit in a caramelized spring roll wrapper.",
+    "imageUrl": "/images/turon.jpg"
+  }
+]

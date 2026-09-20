@@ -1,0 +1,38 @@
+[
+  {
+    "id": "note-1789906659171-06d2",
+    "recipient": "staff",
+    "title": "New order received",
+    "message": "A102 from klai is ready to prepare.",
+    "type": "order",
+    "read": false,
+    "createdAt": "2026-09-20T12:17:39.172Z"
+  },
+  {
+    "id": "note-1789904058520-9550",
+    "recipient": "all",
+    "title": "New canteen idea",
+    "message": "Sizzling Pork Chop was added to the canteen ideas list.",
+    "type": "suggestion",
+    "read": false,
+    "createdAt": "2026-09-20T11:34:18.528Z"
+  },
+  {
+    "id": "note-1789901089444-1056",
+    "recipient": "all",
+    "title": "New canteen idea",
+    "message": "Sizzling Pork Chop was added to the canteen ideas list.",
+    "type": "suggestion",
+    "read": false,
+    "createdAt": "2026-09-20T10:44:49.444Z"
+  },
+  {
+    "id": "note-1789900393456-b484",
+    "recipient": "staff",
+    "title": "New order received",
+    "message": "A102 from ETA Tester is ready to prepare.",
+    "type": "order",
+    "read": false,
+    "createdAt": "2026-09-20T10:33:13.456Z"
+  }
+]
