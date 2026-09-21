@@ -39,47 +39,106 @@
     pollTimer = null;
   }
 
+  let staffPendingEmail = '';
+  let staffResendAt = 0;
+
   function showLogin(message, mode = 'login') {
     const register = mode === 'register';
     const forgot = mode === 'forgot';
+    const verify = mode === 'verify'; // enter the emailed code after registering
+    const reset = mode === 'reset'; // enter the emailed code + a new password
     stopPolling();
     knownIds = null;
     lastOrdersHtml = '';
     $logout.hidden = true;
+
+    const heading = register ? 'Create a verified staff account.' : verify ? 'Confirm your email.' : forgot ? 'Reset staff access.' : reset ? 'Choose a new password.' : 'Staff sign in.';
+    const lede = register
+      ? 'Registration needs the private verification code from the canteen administrator and a real email address that can receive a code.'
+      : verify
+        ? `Enter the 6-digit code we emailed to ${esc(staffPendingEmail)}. It expires in 10 minutes.`
+        : forgot
+          ? 'Enter your staff email and we will send a 6-digit reset code.'
+          : reset
+            ? `Enter the 6-digit code we emailed to ${esc(staffPendingEmail)} and choose a new password.`
+            : 'Use your verified staff email and password to open the operations board.';
+    const cardTitle = register ? 'Register staff account' : verify ? 'Verify your email' : forgot ? 'Forgot password' : reset ? 'Reset password' : 'Sign in to staff portal';
+    const submitLabel = register ? 'Send verification code' : verify ? 'Verify and create account' : forgot ? 'Send reset code' : reset ? 'Change password' : 'Sign in';
+    const links = verify || reset
+      ? '<a href="#" id="resend-staff-code">Resend code</a><br /><a href="#" id="show-staff-login">Back to sign in</a>'
+      : forgot
+        ? '<a href="#" id="show-staff-login">Back to sign in</a>'
+        : register
+          ? 'Already verified? <a href="#" id="show-staff-login">Sign in</a>'
+          : '<a href="#" id="show-staff-forgot">Forgot password?</a><br />New staff member? <a href="#" id="show-staff-register">Register with verification code</a>';
+
     $root.innerHTML = `
-      <div class="staff-auth"><a class="back" href="/">Back to welcome</a><p class="eyebrow">STAFF PORTAL</p><h1>${register ? 'Create a verified staff account.' : forgot ? 'Reset staff access.' : 'Staff sign in.'}</h1><p class="sub">${register ? 'Registration requires the private verification code issued by the canteen administrator.' : forgot ? 'Enter your staff email to request password reset instructions.' : 'Use your verified staff email and password to open the operations board.'}</p>
+      <div class="staff-auth"><a class="back" href="/">Back to welcome</a><p class="eyebrow">STAFF PORTAL</p><h1>${heading}</h1><p class="sub">${lede}</p>
       <form class="form-card login-card" id="login-form">
-        <h2>${register ? 'Register staff account' : forgot ? 'Forgot password' : 'Sign in to staff portal'}</h2>
+        <h2>${cardTitle}</h2>
         ${message ? `<div class="notice notice-out">${esc(message)}</div>` : ''}
         ${register ? '<label class="field"><span>Name</span><input id="staff-name" type="text" autocomplete="name" required /></label>' : ''}
-        <label class="field"><span>Staff email</span><input id="staff-email" type="email" autocomplete="email" required /></label>
-        ${forgot ? '' : '<label class="field"><span>Password</span><input id="staff-password" type="password" minlength="6" autocomplete="current-password" required /></label>'}
+        ${verify || reset ? '<label class="field"><span>6-digit code</span><input id="staff-otp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required /></label>' : ''}
+        ${verify || reset ? '' : '<label class="field"><span>Staff email</span><input id="staff-email" type="email" autocomplete="email" required /></label>'}
+        ${forgot || verify || reset ? '' : `<label class="field"><span>Password</span><input id="staff-password" type="password" ${register ? 'minlength="8"' : ''} autocomplete="${register ? 'new-password' : 'current-password'}" required /></label>`}
+        ${reset ? '<label class="field"><span>New password</span><input id="staff-newpass" type="password" minlength="8" autocomplete="new-password" required /></label>' : ''}
         ${register ? '<label class="field"><span>Staff verification code</span><input id="staff-code" type="password" autocomplete="off" required /></label>' : ''}
-        <button class="btn btn-primary btn-block" type="submit">${register ? 'Register staff account' : forgot ? 'Send reset instructions' : 'Sign in'}</button>
-        <p class="auth-links">${forgot ? '<a href="#" id="show-staff-login">Back to sign in</a>' : register ? 'Already verified? <a href="#" id="show-staff-login">Sign in</a>' : '<a href="#" id="show-staff-forgot">Forgot password?</a><br />New staff member? <a href="#" id="show-staff-register">Register with verification code</a>'}</p>
+        <button class="btn btn-primary btn-block" type="submit">${submitLabel}</button>
+        <p class="auth-links">${links}</p>
       </form></div>`;
-    const input = document.getElementById(register ? 'staff-name' : 'staff-email');
-    input.focus();
-    const switchLink = document.getElementById(forgot || register ? 'show-staff-login' : 'show-staff-register');
-    switchLink.addEventListener('click', (event) => { event.preventDefault(); showLogin('', forgot || register ? 'login' : 'register'); });
-    const forgotLink = document.getElementById('show-staff-forgot');
-    if (forgotLink) forgotLink.addEventListener('click', (event) => { event.preventDefault(); showLogin('', 'forgot'); });
+
+    const firstInput = $root.querySelector('input');
+    if (firstInput) firstInput.focus();
+
+    const bind = (id, handler) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('click', (event) => { event.preventDefault(); handler(); });
+    };
+    bind('show-staff-login', () => showLogin('', 'login'));
+    bind('show-staff-register', () => showLogin('', 'register'));
+    bind('show-staff-forgot', () => showLogin('', 'forgot'));
+    bind('resend-staff-code', async () => {
+      if (Date.now() < staffResendAt) {
+        toast('Please wait a minute before asking for another code.', 'warn');
+        return;
+      }
+      try {
+        const result = await api(verify ? '/api/auth/staff/register/resend' : '/api/auth/staff/forgot-password', { method: 'POST', body: JSON.stringify({ email: staffPendingEmail }) });
+        staffResendAt = Date.now() + 60000;
+        toast(result.message, 'ok');
+      } catch (err) {
+        toast(err.message, 'bad');
+      }
+    });
+
     document.getElementById('login-form').addEventListener('submit', async (e) => {
       e.preventDefault();
+      const value = (id) => document.getElementById(id)?.value || '';
       try {
-        const body = {
-          name: document.getElementById('staff-name')?.value,
-          email: document.getElementById('staff-email').value,
-          password: document.getElementById('staff-password').value,
-          inviteCode: document.getElementById('staff-code')?.value,
-        };
-        if (forgot) {
-          const result = await api('/api/auth/staff/forgot-password', { method: 'POST', body: JSON.stringify({ email: body.email }) });
-          toast(result.message, 'ok');
-          return;
+        if (verify) {
+          await api('/api/auth/staff/register/verify', { method: 'POST', body: JSON.stringify({ email: staffPendingEmail, code: value('staff-otp') }) });
+          return showLogin('Email verified. Your staff account is ready. Sign in to continue.', 'login');
         }
-        const result = await api(`/api/auth/staff/${register ? 'register' : 'login'}`, { method: 'POST', body: JSON.stringify(body) });
-        if (register) return showLogin('Staff account created. Sign in to continue.', 'login');
+        if (reset) {
+          await api('/api/auth/staff/reset-password', { method: 'POST', body: JSON.stringify({ email: staffPendingEmail, code: value('staff-otp'), password: value('staff-newpass') }) });
+          return showLogin('Password changed. Sign in with your new password.', 'login');
+        }
+        if (forgot) {
+          const result = await api('/api/auth/staff/forgot-password', { method: 'POST', body: JSON.stringify({ email: value('staff-email') }) });
+          staffPendingEmail = value('staff-email').trim().toLowerCase();
+          staffResendAt = Date.now() + 60000;
+          return showLogin(result.message, 'reset');
+        }
+        if (register) {
+          const result = await api('/api/auth/staff/register', {
+            method: 'POST',
+            body: JSON.stringify({ name: value('staff-name'), email: value('staff-email'), password: value('staff-password'), inviteCode: value('staff-code') }),
+          });
+          staffPendingEmail = result.email;
+          staffResendAt = Date.now() + 60000;
+          return showLogin(result.message, 'verify');
+        }
+        const result = await api('/api/auth/staff/login', { method: 'POST', body: JSON.stringify({ email: value('staff-email'), password: value('staff-password') }) });
         staffToken = result.token;
         try {
           sessionStorage.setItem('cfs_staff_token', staffToken);

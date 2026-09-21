@@ -130,6 +130,50 @@
     }, 2800);
   }
 
+  /* Show / hide button on every password box. It also works for screens that are drawn later. */
+  (function addPasswordToggles() {
+    if (!window.MutationObserver || !document.body) return;
+    var style = document.createElement('style');
+    style.textContent =
+      '.pw-wrap{position:relative;display:block;width:100%}' +
+      '.pw-wrap>input{width:100%;box-sizing:border-box;padding-right:46px}' +
+      '.pw-toggle{position:absolute;top:50%;right:8px;transform:translateY(-50%);width:34px;height:34px;padding:0;border:0;border-radius:8px;background:transparent;color:inherit;opacity:.65;cursor:pointer;display:flex;align-items:center;justify-content:center}' +
+      '.pw-toggle:hover,.pw-toggle:focus-visible{opacity:1}' +
+      '.pw-toggle svg{width:20px;height:20px}';
+    document.head.appendChild(style);
+
+    var svgOpen = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
+    var svgOff = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.9 10.9 0 0 1 12 19c-6.5 0-10-7-10-7a18.1 18.1 0 0 1 5.06-5.94M9.9 4.24A9.1 9.1 0 0 1 12 5c6.5 0 10 7 10 7a18.5 18.5 0 0 1-2.16 3.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>';
+
+    function decorate(input) {
+      if (input.getAttribute('data-pw-ready')) return;
+      input.setAttribute('data-pw-ready', '1');
+      var wrap = document.createElement('span');
+      wrap.className = 'pw-wrap';
+      input.parentNode.insertBefore(wrap, input);
+      wrap.appendChild(input);
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'pw-toggle';
+      button.setAttribute('aria-label', 'Show password');
+      button.innerHTML = svgOpen;
+      button.addEventListener('click', function () {
+        var showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        button.innerHTML = showing ? svgOpen : svgOff;
+        button.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+        input.focus();
+      });
+      wrap.appendChild(button);
+    }
+
+    function scan() {
+      document.querySelectorAll('input[type="password"]').forEach(decorate);
+    }
+    new MutationObserver(scan).observe(document.body, { childList: true, subtree: true });
+    scan();
+  })();
+
   window.Common = {
     esc: esc,
     peso: peso,

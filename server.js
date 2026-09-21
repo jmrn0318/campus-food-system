@@ -3,11 +3,19 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const crypto = require('crypto');
+const dns = require('dns').promises;
 
 const app = express();
+app.set('trust proxy', 1); // Railway sits behind a proxy; this makes req.ip the visitor's real IP
 const PORT = process.env.PORT || 3000;
 const STAFF_PIN = process.env.STAFF_PIN || '1234';
 const STAFF_INVITE_CODE = process.env.STAFF_INVITE_CODE || '2006';
+
+// Email (Brevo HTTPS API, works on Railway; SMTP is blocked there on non-Pro plans)
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const MAIL_FROM = process.env.MAIL_FROM || ''; // must be a sender you verified inside Brevo
+const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Campus Pickup';
+const MAIL_ENABLED = Boolean(BREVO_API_KEY && MAIL_FROM);
 
 // Data directory path. On a host with a persistent volume, set DATA_DIR to its mount path (e.g. /data).
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
@@ -147,16 +155,214 @@ const requireStaffMenuAccess = (req, res, next) => {
 
 const publicUser = (user) => ({ id: user.id, name: user.name, email: user.email, role: user.role });
 
-const registerUser = (name, email, password, role) => {
+// ==========================================
+// EMAIL VERIFICATION + PASSWORD RESET (6-digit codes sent by email)
+// ==========================================
+
+const MIN_PASSWORD = 8;
+const CODE_TTL_MS = 10 * 60 * 1000;
+const RESEND_COOLDOWN_MS = 60 * 1000;
+const MAX_CODE_ATTEMPTS = 5;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const pendingRegistrations = new Map(); // key: "role:email" -> details waiting for the emailed code
+const passwordResets = new Map(); // key: "role:email" -> reset code waiting to be used
+const rateBuckets = new Map();
+
+setInterval(() => {
+  const now = Date.now();
+  [pendingRegistrations, passwordResets].forEach((bucket) => {
+    for (const [key, record] of bucket) if (record.expiresAt < now) bucket.delete(key);
+  });
+  for (const [key, bucket] of rateBuckets) if (bucket.resetAt < now) rateBuckets.delete(key);
+}, 5 * 60 * 1000).unref();
+
+// Simple per-IP limit so nobody can spam the email quota or guess codes quickly.
+const limitRequests = (name, max, windowMs) => (req, res, next) => {
+  const key = `${name}:${req.ip}`;
+  const now = Date.now();
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt < now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return next();
+  }
+  if (bucket.count >= max) return res.status(429).json({ error: 'Too many attempts. Please wait a few minutes and try again.' });
+  bucket.count += 1;
+  next();
+};
+const codeRequestLimit = limitRequests('code-request', 30, 15 * 60 * 1000);
+const codeCheckLimit = limitRequests('code-check', 60, 15 * 60 * 1000);
+
+const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const normalizeEmail = (email) => String(email || '').toLowerCase().trim();
+const generateCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+const safeEqual = (a, b) => {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+const secondsLeft = (sentAt) => Math.max(1, Math.ceil((RESEND_COOLDOWN_MS - (Date.now() - sentAt)) / 1000));
+
+const sendMail = async (to, subject, text, html) => {
+  if (!MAIL_ENABLED) {
+    console.warn(`[mail] Email is not configured (set BREVO_API_KEY and MAIL_FROM). NOT sent to ${to}:\n${text}`);
+    return;
+  }
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ sender: { name: MAIL_FROM_NAME, email: MAIL_FROM }, to: [{ email: to }], subject, textContent: text, htmlContent: html }),
+    signal: AbortSignal.timeout(10000)
+  });
+  if (!response.ok) throw new Error(`Brevo responded ${response.status}: ${(await response.text()).slice(0, 300)}`);
+};
+
+const sendCodeEmail = (to, name, code, purpose) => {
+  const action = purpose === 'reset' ? 'reset your password' : 'verify your email address';
+  const subject = purpose === 'reset' ? 'Your Campus Pickup password reset code' : 'Your Campus Pickup verification code';
+  const text = `Hi ${name},\n\nUse this code to ${action}: ${code}\n\nIt expires in 10 minutes. If you did not ask for it, you can ignore this email.\n\nCampus Pickup`;
+  const html = `<div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:16px"><h2 style="margin:0 0 12px">Campus Pickup</h2><p>Hi ${escapeHtml(name)},</p><p>Use this code to ${action}:</p><p style="font-size:32px;letter-spacing:8px;font-weight:bold;margin:16px 0">${code}</p><p style="color:#555">It expires in 10 minutes. If you did not ask for it, you can ignore this email.</p></div>`;
+  return sendMail(to, subject, text, html);
+};
+
+// A made-up domain (like "asdf@notreal123.xyz") has no mail server, so we can reject it right away.
+const domainCanReceiveMail = async (domain) => {
+  const missing = (err) => err && (err.code === 'ENOTFOUND' || err.code === 'ENODATA');
+  try {
+    if ((await dns.resolveMx(domain)).length) return true;
+  } catch (err) {
+    if (!missing(err)) return true; // our DNS had a hiccup; the emailed code will still decide
+  }
+  try {
+    return (await dns.resolve4(domain)).length > 0;
+  } catch (err) {
+    return !missing(err);
+  }
+};
+
+const issueRegistrationCode = async (key, record) => {
+  record.code = generateCode();
+  record.expiresAt = Date.now() + CODE_TTL_MS;
+  record.sentAt = Date.now();
+  record.attempts = 0;
+  pendingRegistrations.set(key, record);
+  try {
+    await sendCodeEmail(record.email, record.name, record.code, 'register');
+  } catch (error) {
+    pendingRegistrations.delete(key);
+    console.error('[mail] Could not send verification email:', error.message);
+    return { status: 502, error: 'We could not send the verification email. Please try again in a moment.' };
+  }
+  return { status: 202, email: record.email, message: `We sent a 6-digit code to ${record.email}. It expires in 10 minutes.` };
+};
+
+const startRegistration = async ({ role, name, email, password }) => {
+  const normalizedEmail = normalizeEmail(email);
+  const cleanName = String(name || '').trim();
+  if (!cleanName || !normalizedEmail || !password) return { status: 400, error: 'Name, email, and password are required.' };
+  if (String(password).length < MIN_PASSWORD) return { status: 400, error: `Password must be at least ${MIN_PASSWORD} characters.` };
+  if (normalizedEmail.length > 254 || !EMAIL_PATTERN.test(normalizedEmail)) return { status: 400, error: 'Please enter a valid email address.' };
+  if (readData(USERS_FILE).some((user) => user.email === normalizedEmail)) return { status: 409, error: 'An account with that email already exists.' };
+  if (!(await domainCanReceiveMail(normalizedEmail.split('@')[1]))) return { status: 400, error: 'That email address does not look real. Please check it for typos.' };
+  const key = `${role}:${normalizedEmail}`;
+  const existing = pendingRegistrations.get(key);
+  if (existing && Date.now() - existing.sentAt < RESEND_COOLDOWN_MS) return { status: 429, error: `Please wait ${secondsLeft(existing.sentAt)} seconds before asking for another code.` };
+  return issueRegistrationCode(key, { role, name: cleanName, email: normalizedEmail, ...hashPassword(String(password)) });
+};
+
+const resendRegistration = async (role, email) => {
+  const key = `${role}:${normalizeEmail(email)}`;
+  const record = pendingRegistrations.get(key);
+  if (!record) return { status: 400, error: 'No pending registration for that email. Please register again.' };
+  if (Date.now() - record.sentAt < RESEND_COOLDOWN_MS) return { status: 429, error: `Please wait ${secondsLeft(record.sentAt)} seconds before asking for another code.` };
+  return issueRegistrationCode(key, record);
+};
+
+const finishRegistration = (role, email, code) => {
+  const key = `${role}:${normalizeEmail(email)}`;
+  const pending = pendingRegistrations.get(key);
+  if (!pending) return { status: 400, error: 'No pending registration for that email. Please register again.' };
+  if (Date.now() > pending.expiresAt) {
+    pendingRegistrations.delete(key);
+    return { status: 400, error: 'That code has expired. Please request a new one.' };
+  }
+  if (!safeEqual(pending.code, String(code || '').trim())) {
+    pending.attempts += 1;
+    if (pending.attempts >= MAX_CODE_ATTEMPTS) {
+      pendingRegistrations.delete(key);
+      return { status: 429, error: 'Too many wrong codes. Please register again.' };
+    }
+    return { status: 400, error: 'Incorrect verification code.' };
+  }
   const users = readData(USERS_FILE);
-  const normalizedEmail = String(email || '').toLowerCase().trim();
-  if (!name || !normalizedEmail || !password || String(password).length < 6) return { error: 'Name, email, and a password of at least 6 characters are required.' };
-  if (users.some((user) => user.email === normalizedEmail)) return { error: 'An account with that email already exists.', status: 409 };
-  const credentials = hashPassword(String(password));
-  const user = { id: `${role}-${Date.now()}`, name: String(name).trim(), email: normalizedEmail, role, ...credentials, createdAt: new Date().toISOString() };
+  if (users.some((user) => user.email === pending.email)) {
+    pendingRegistrations.delete(key);
+    return { status: 409, error: 'An account with that email already exists.' };
+  }
+  const user = { id: `${role}-${Date.now()}`, name: pending.name, email: pending.email, role, salt: pending.salt, passwordHash: pending.passwordHash, emailVerified: true, createdAt: new Date().toISOString() };
   users.push(user);
   writeData(USERS_FILE, users);
-  return { user, token: tokenFor(user) };
+  pendingRegistrations.delete(key);
+  return { status: 201, user, token: tokenFor(user) };
+};
+
+const RESET_REPLY = { message: 'If that email is registered, a 6-digit reset code has been sent. It expires in 10 minutes.' };
+
+// Always answers the same way, so nobody can use this form to find out which emails have accounts.
+const startPasswordReset = async (role, email) => {
+  const normalizedEmail = normalizeEmail(email);
+  if (!EMAIL_PATTERN.test(normalizedEmail)) return RESET_REPLY;
+  const user = readData(USERS_FILE).find((entry) => entry.email === normalizedEmail && entry.role === role);
+  if (!user) return RESET_REPLY;
+  const key = `${role}:${normalizedEmail}`;
+  const existing = passwordResets.get(key);
+  if (existing && Date.now() - existing.sentAt < RESEND_COOLDOWN_MS) return RESET_REPLY;
+  const record = { userId: user.id, code: generateCode(), expiresAt: Date.now() + CODE_TTL_MS, sentAt: Date.now(), attempts: 0 };
+  passwordResets.set(key, record);
+  try {
+    await sendCodeEmail(user.email, user.name, record.code, 'reset');
+  } catch (error) {
+    passwordResets.delete(key);
+    console.error('[mail] Could not send reset email:', error.message);
+  }
+  return RESET_REPLY;
+};
+
+const finishPasswordReset = (role, email, code, password) => {
+  if (String(password || '').length < MIN_PASSWORD) return { status: 400, error: `Password must be at least ${MIN_PASSWORD} characters.` };
+  const key = `${role}:${normalizeEmail(email)}`;
+  const record = passwordResets.get(key);
+  if (!record || Date.now() > record.expiresAt) {
+    passwordResets.delete(key);
+    return { status: 400, error: 'That code is invalid or has expired. Please request a new one.' };
+  }
+  if (!safeEqual(record.code, String(code || '').trim())) {
+    record.attempts += 1;
+    if (record.attempts >= MAX_CODE_ATTEMPTS) {
+      passwordResets.delete(key);
+      return { status: 429, error: 'Too many wrong codes. Please request a new one.' };
+    }
+    return { status: 400, error: 'Incorrect reset code.' };
+  }
+  const users = readData(USERS_FILE);
+  const index = users.findIndex((entry) => entry.id === record.userId && entry.role === role);
+  if (index === -1) {
+    passwordResets.delete(key);
+    return { status: 400, error: 'That code is invalid or has expired. Please request a new one.' };
+  }
+  Object.assign(users[index], hashPassword(String(password)));
+  writeData(USERS_FILE, users);
+  passwordResets.delete(key);
+  for (const [token, session] of sessions) if (session.id === users[index].id) sessions.delete(token); // sign out everywhere
+  return { status: 200 };
+};
+
+const replyPending = (res, result) => {
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.status(202).json({ verificationRequired: true, email: result.email, message: result.message });
+};
+const replyCreated = (res, result) => {
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.status(201).json({ token: result.token, user: publicUser(result.user) });
 };
 
 const loginUser = (email, password, role) => {
@@ -165,11 +371,17 @@ const loginUser = (email, password, role) => {
   return { user, token: tokenFor(user) };
 };
 
-app.post('/api/auth/staff/register', (req, res) => {
-  if (String(req.body.inviteCode || '').trim() !== STAFF_INVITE_CODE) return res.status(403).json({ error: 'Valid staff verification code required.' });
-  const result = registerUser(req.body.name, req.body.email, req.body.password, 'staff');
-  if (result.error) return res.status(result.status || 400).json({ error: result.error });
-  res.status(201).json({ token: result.token, user: publicUser(result.user) });
+app.post('/api/auth/staff/register', codeRequestLimit, async (req, res) => {
+  if (!safeEqual(String(req.body.inviteCode || '').trim(), STAFF_INVITE_CODE)) return res.status(403).json({ error: 'Valid staff verification code required.' });
+  replyPending(res, await startRegistration({ role: 'staff', name: req.body.name, email: req.body.email, password: req.body.password }));
+});
+
+app.post('/api/auth/staff/register/resend', codeRequestLimit, async (req, res) => {
+  replyPending(res, await resendRegistration('staff', req.body.email));
+});
+
+app.post('/api/auth/staff/register/verify', codeCheckLimit, (req, res) => {
+  replyCreated(res, finishRegistration('staff', req.body.email, req.body.code));
 });
 
 app.post('/api/auth/staff/login', (req, res) => {
@@ -178,8 +390,14 @@ app.post('/api/auth/staff/login', (req, res) => {
   res.json({ token: result.token, user: publicUser(result.user) });
 });
 
-app.post('/api/auth/staff/forgot-password', (req, res) => {
-  res.json({ message: 'If that staff email is registered, reset instructions have been sent. Contact the canteen administrator if you need help.' });
+app.post('/api/auth/staff/forgot-password', codeRequestLimit, async (req, res) => {
+  res.json(await startPasswordReset('staff', req.body.email));
+});
+
+app.post('/api/auth/staff/reset-password', codeCheckLimit, (req, res) => {
+  const result = finishPasswordReset('staff', req.body.email, req.body.code, req.body.password);
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.json({ message: 'Password changed. You can now sign in.' });
 });
 
 app.post('/api/auth/staff/logout', (req, res) => {
@@ -245,18 +463,17 @@ const pushNotification = (recipient, title, message, type = 'info') => {
 // API ROUTES
 // ==========================================
 
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', codeRequestLimit, async (req, res) => {
   const { name, email, password } = req.body;
-  const normalizedEmail = String(email || '').toLowerCase().trim();
-  if (!name || !normalizedEmail || !password || String(password).length < 6) return res.status(400).json({ error: 'Name, email, and a password of at least 6 characters are required.' });
-  const users = readData(USERS_FILE);
-  if (users.some((user) => user.email === normalizedEmail)) return res.status(409).json({ error: 'An account with that email already exists.' });
-  const credentials = hashPassword(String(password));
-  const user = { id: `user-${Date.now()}`, name: String(name).trim(), email: normalizedEmail, role: 'customer', ...credentials, createdAt: new Date().toISOString() };
-  users.push(user);
-  writeData(USERS_FILE, users);
-  const token = tokenFor(user);
-  res.status(201).json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+  replyPending(res, await startRegistration({ role: 'customer', name, email, password }));
+});
+
+app.post('/api/auth/register/resend', codeRequestLimit, async (req, res) => {
+  replyPending(res, await resendRegistration('customer', req.body.email));
+});
+
+app.post('/api/auth/register/verify', codeCheckLimit, (req, res) => {
+  replyCreated(res, finishRegistration('customer', req.body.email, req.body.code));
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -265,8 +482,14 @@ app.post('/api/auth/login', (req, res) => {
   res.json({ token: tokenFor(user), user: { id: user.id, name: user.name, email: user.email, role: user.role } });
 });
 
-app.post('/api/auth/forgot-password', (req, res) => {
-  res.json({ message: 'If that email is registered, reset instructions have been sent. For this local demo, contact the canteen administrator.' });
+app.post('/api/auth/forgot-password', codeRequestLimit, async (req, res) => {
+  res.json(await startPasswordReset('customer', req.body.email));
+});
+
+app.post('/api/auth/reset-password', codeCheckLimit, (req, res) => {
+  const result = finishPasswordReset('customer', req.body.email, req.body.code, req.body.password);
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.json({ message: 'Password changed. You can now sign in.' });
 });
 
 app.get('/api/auth/me', (req, res) => {
@@ -495,6 +718,11 @@ app.listen(PORT, () => {
   }
   if (STAFF_INVITE_CODE === '2006') {
     console.warn('[warn] Using the default staff verification code. Set STAFF_INVITE_CODE before deploying.');
+  }
+  if (!MAIL_ENABLED) {
+    console.warn('[warn] Email is NOT configured. Set BREVO_API_KEY and MAIL_FROM so verification and reset codes are emailed. Until then, codes are only printed in these logs.');
+  } else {
+    console.log(`[info] Email enabled via Brevo (from ${MAIL_FROM}).`);
   }
   console.log(`Campus Pickup is running:`);
   console.log(`  Student app : http://localhost:${PORT}`);

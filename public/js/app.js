@@ -193,28 +193,112 @@
   function renderAuth(mode) {
     const forgot = mode === 'forgot';
     const register = mode === 'register';
-    $view.innerHTML = `<div class="auth-layout"><div class="auth-aside"><a class="back" href="#/welcome">Back to welcome</a><p class="eyebrow">CUSTOMER ACCESS</p><h1>${forgot ? 'Reset your access.' : register ? 'Create your canteen account.' : 'Sign in to order.'}</h1><p>${forgot ? 'Enter your email and we will show the next step.' : 'Your customer account lets you order online, track the estimated ready time, and view your pickup history.'}</p></div><form class="form-card auth-card" id="auth-form"><h2>${forgot ? 'Forgot password' : register ? 'Register as customer' : 'Customer sign in'}</h2>${register ? '<label class="field"><span>Name</span><input name="name" required autocomplete="name" /></label>' : ''}<label class="field"><span>Email</span><input name="email" type="email" required autocomplete="email" /></label>${forgot ? '' : '<label class="field"><span>Password</span><input name="password" type="password" minlength="6" required autocomplete="current-password" /></label>'}<button class="btn btn-primary btn-block" type="submit">${forgot ? 'Send reset instructions' : register ? 'Register customer account' : 'Sign in'}</button><p class="auth-links">${forgot ? '<a href="#/login">Back to sign in</a>' : register ? 'Already registered? <a href="#/login">Sign in</a>' : '<a href="#/forgot">Forgot password?</a><br />New customer? <a href="#/register">Register</a>'}</p></form></div>`;
-    document.getElementById('auth-form').addEventListener('submit', async (event) => {
+    let step = 'form'; // 'form' first, then 'code' once we have emailed a 6-digit code
+    let pendingEmail = '';
+    let resendAt = 0;
+
+    const headline = forgot ? 'Reset your access.' : register ? 'Create your canteen account.' : 'Sign in to order.';
+    const lede = forgot
+      ? 'Enter your email and we will send a 6-digit code to reset your password.'
+      : register
+        ? 'We will email a 6-digit code to confirm your address before your account is created.'
+        : 'Your customer account lets you order online, track the estimated ready time, and view your pickup history.';
+
+    $view.innerHTML = `<div class="auth-layout"><div class="auth-aside"><a class="back" href="#/welcome">Back to welcome</a><p class="eyebrow">CUSTOMER ACCESS</p><h1>${headline}</h1><p>${lede}</p></div><form class="form-card auth-card" id="auth-form"></form></div>`;
+    const formEl = document.getElementById('auth-form');
+
+    function draw() {
+      if (step === 'code') {
+        formEl.innerHTML = `<h2>${forgot ? 'Enter your reset code' : 'Verify your email'}</h2>
+          <p class="hint">We sent a 6-digit code to <strong>${esc(pendingEmail)}</strong>. It expires in 10 minutes. Check your spam folder if you do not see it.</p>
+          <label class="field"><span>6-digit code</span><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required /></label>
+          ${forgot ? '<label class="field"><span>New password</span><input name="password" type="password" minlength="8" required autocomplete="new-password" /></label>' : ''}
+          <button class="btn btn-primary btn-block" type="submit">${forgot ? 'Change password' : 'Verify and create account'}</button>
+          <p class="auth-links"><a href="#" id="resend-code">Resend code</a><br /><a href="#" id="change-email">Use a different email</a></p>`;
+        formEl.querySelector('input[name="code"]').focus();
+        return;
+      }
+      formEl.innerHTML = `<h2>${forgot ? 'Forgot password' : register ? 'Register as customer' : 'Customer sign in'}</h2>
+        ${register ? '<label class="field"><span>Name</span><input name="name" required autocomplete="name" /></label>' : ''}
+        <label class="field"><span>Email</span><input name="email" type="email" required autocomplete="email" /></label>
+        ${forgot ? '' : `<label class="field"><span>Password</span><input name="password" type="password" ${register ? 'minlength="8"' : ''} required autocomplete="${register ? 'new-password' : 'current-password'}" /></label>`}
+        ${register ? '<p class="hint">Use at least 8 characters. We will email you a code to confirm your address.</p>' : ''}
+        <button class="btn btn-primary btn-block" type="submit">${forgot ? 'Send reset code' : register ? 'Send verification code' : 'Sign in'}</button>
+        <p class="auth-links">${forgot ? '<a href="#/login">Back to sign in</a>' : register ? 'Already registered? <a href="#/login">Sign in</a>' : '<a href="#/forgot">Forgot password?</a><br />New customer? <a href="#/register">Register</a>'}</p>`;
+    }
+    draw();
+
+    formEl.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const form = new FormData(event.currentTarget);
+      const form = Object.fromEntries(new FormData(formEl).entries());
+      const button = formEl.querySelector('button[type="submit"]');
+      button.disabled = true;
       try {
-        if (forgot) {
-          const result = await api('/api/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email: form.get('email') }) });
-          toast(result.message, 'ok');
-          return;
-        }
-        const result = await api(`/api/auth/${register ? 'register' : 'login'}`, { method: 'POST', body: JSON.stringify(Object.fromEntries(form.entries())) });
-        if (register) {
-          toast('Account created. Sign in to open the canteen.', 'ok');
+        if (step === 'code') {
+          if (forgot) {
+            await api('/api/auth/reset-password', { method: 'POST', body: JSON.stringify({ email: pendingEmail, code: form.code, password: form.password }) });
+            toast('Password changed. Sign in with your new password.', 'ok');
+          } else {
+            await api('/api/auth/register/verify', { method: 'POST', body: JSON.stringify({ email: pendingEmail, code: form.code }) });
+            toast('Email verified. Your account is ready. Sign in to continue.', 'ok');
+          }
           location.hash = '#/login';
           return;
         }
+        if (forgot) {
+          const result = await api('/api/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email: form.email }) });
+          pendingEmail = String(form.email).trim().toLowerCase();
+          resendAt = Date.now() + 60000;
+          step = 'code';
+          draw();
+          toast(result.message, 'ok');
+          return;
+        }
+        if (register) {
+          const result = await api('/api/auth/register', { method: 'POST', body: JSON.stringify(form) });
+          pendingEmail = result.email;
+          resendAt = Date.now() + 60000;
+          step = 'code';
+          draw();
+          toast(result.message, 'ok');
+          return;
+        }
+        const result = await api('/api/auth/login', { method: 'POST', body: JSON.stringify(form) });
         store.set('cfs_token', result.token);
         user = result.user;
         store.set('cfs_user', user);
         refreshChrome();
         location.hash = '#/';
-      } catch (error) { toast(error.message, 'bad'); }
+      } catch (error) {
+        toast(error.message, 'bad');
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    formEl.addEventListener('click', async (event) => {
+      const link = event.target.closest('a');
+      if (!link) return;
+      if (link.id === 'change-email') {
+        event.preventDefault();
+        step = 'form';
+        draw();
+        return;
+      }
+      if (link.id === 'resend-code') {
+        event.preventDefault();
+        if (Date.now() < resendAt) {
+          toast('Please wait a minute before asking for another code.', 'warn');
+          return;
+        }
+        try {
+          const result = await api(forgot ? '/api/auth/forgot-password' : '/api/auth/register/resend', { method: 'POST', body: JSON.stringify({ email: pendingEmail }) });
+          resendAt = Date.now() + 60000;
+          toast(result.message, 'ok');
+        } catch (error) {
+          toast(error.message, 'bad');
+        }
+      }
     });
   }
 
