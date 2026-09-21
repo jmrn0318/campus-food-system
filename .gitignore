@@ -6,3 +6,4 @@ node_modules/
 data/menu.json
 data/orders.json
 data/*.tmp
+data/otps.json

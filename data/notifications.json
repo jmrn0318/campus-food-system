@@ -1,5 +1,14 @@
 [
   {
+    "id": "note-1789957608605-f518",
+    "recipient": "staff",
+    "title": "New order received",
+    "message": "A103 from chelzy is ready to prepare.",
+    "type": "order",
+    "read": false,
+    "createdAt": "2026-09-21T02:26:48.607Z"
+  },
+  {
     "id": "note-1789906659171-06d2",
     "recipient": "staff",
     "title": "New order received",

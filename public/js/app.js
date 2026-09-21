@@ -10,7 +10,7 @@
   /* Settings                                                          */
   /* ---------------------------------------------------------------- */
 
-  const PICKUP_POINT = 'Pickup counter, Canteen'; // change to your campus canteen name
+  const PICKUP_POINT = 'Pickup counter, Canteen'; 
   const TRACK_POLL_MS = 4000;
   const MENU_POLL_MS = 10000;
   const HISTORY_POLL_MS = 6000;
@@ -59,14 +59,14 @@
       try {
         localStorage.setItem(key, JSON.stringify(value));
       } catch (e) {
-        /* private mode etc. - app still works, it just will not remember */
+        /* ignore */
       }
     },
   };
 
   let menu = [];
-  let cart = store.get('cfs_cart', []); // [{ id, qty }]
-  let orderIds = store.get('cfs_orders', []); // ids of orders placed on this phone
+  let cart = store.get('cfs_cart', []);
+  let orderIds = store.get('cfs_orders', []);
   let user = store.get('cfs_user', null);
   const menuFilter = { cat: 'All', q: '', availableOnly: false };
 
@@ -74,7 +74,7 @@
   const $cartBar = document.getElementById('cart-bar');
   const $navCount = document.getElementById('nav-cart-count');
 
-  let token = 0; // increases on every navigation so slow requests can't paint over a newer page
+  let token = 0;
   let timers = [];
   const every = (fn, ms) => timers.push(setInterval(fn, ms));
   const clearTimers = () => {
@@ -150,8 +150,17 @@
   function refreshChrome() {
     const nav = document.querySelector('.bottom-nav');
     const alertsLink = document.getElementById('alerts-link');
+    const accountLink = document.getElementById('account-link');
+
     if (nav) nav.hidden = !user;
     if (alertsLink) alertsLink.hidden = !user;
+    if (accountLink) {
+      accountLink.hidden = !user;
+      if (user) {
+        accountLink.textContent = user.name ? user.name.split(' ')[0] : 'Profile';
+        accountLink.href = '#/account';
+      }
+    }
 
     const count = cartCount();
     $navCount.textContent = count;
@@ -175,11 +184,6 @@
       if (a.dataset.nav === section) a.setAttribute('aria-current', 'page');
       else a.removeAttribute('aria-current');
     });
-    const accountLink = document.getElementById('account-link');
-    if (accountLink) {
-      accountLink.textContent = user ? user.name.split(' ')[0] : 'Sign in';
-      accountLink.href = user ? '#/account' : '#/login';
-    }
   }
 
   function renderWelcome() {
@@ -193,7 +197,7 @@
   function renderAuth(mode) {
     const forgot = mode === 'forgot';
     const register = mode === 'register';
-    let step = 'form'; // 'form' first, then 'code' once we have emailed a 6-digit code
+    let step = 'form';
     let pendingEmail = '';
     let resendAt = 0;
 
@@ -302,10 +306,31 @@
     });
   }
 
+  // Customer Profile View
   function renderAccount() {
-    $view.innerHTML = `<div class="page-head"><p class="eyebrow">YOUR CAMPUS PROFILE</p><h1>${esc(user.name)}</h1><p class="sub">${esc(user.email)}</p></div><section class="form-card account-card"><div class="account-role"><span>Account type</span><strong>Student account</strong></div><p class="hint">Your orders, alerts, and menu suggestions are kept in your student space.</p><button class="btn btn-ghost btn-block" id="sign-out" type="button">Sign out</button></section>`;
+    if (!user) {
+      location.hash = '#/login';
+      return;
+    }
+    $view.innerHTML = `
+      <a class="back" href="#/">Back to menu</a>
+      <div class="page-head">
+        <p class="eyebrow">STUDENT PROFILE</p>
+        <h1>${esc(user.name || 'Student Customer')}</h1>
+        <p class="sub">${esc(user.email || '')}</p>
+      </div>
+      <section class="form-card account-card">
+        <h2>Account Details</h2>
+        <div class="account-role">
+          <span>Account Type</span>
+          <strong>Student / Customer</strong>
+        </div>
+        <p class="hint">Your active orders, order history, and preferences are linked to this account.</p>
+        <button class="btn btn-ghost btn-block" id="sign-out" type="button">Sign out</button>
+      </section>`;
+
     document.getElementById('sign-out').addEventListener('click', async () => {
-      try { await api('/api/auth/logout', { method: 'POST' }); } catch (error) { /* local session still clears */ }
+      try { await api('/api/auth/logout', { method: 'POST' }); } catch (error) { /* local clear */ }
       store.set('cfs_token', null);
       store.set('cfs_user', null);
       user = null;
@@ -417,7 +442,7 @@
       paintMenu();
     });
 
-    if (menu.length) paintMenu(); // show what we already know while refreshing
+    if (menu.length) paintMenu();
     try {
       await loadMenu();
     } catch (err) {
@@ -428,7 +453,6 @@
     paintMenu();
     refreshChrome();
 
-    // Keep availability live while the student is browsing
     every(async () => {
       try {
         const before = JSON.stringify(menu);
@@ -438,7 +462,7 @@
           refreshChrome();
         }
       } catch (e) {
-        /* try again next time */
+        /* try again */
       }
     }, MENU_POLL_MS);
   }
@@ -597,7 +621,7 @@
     }
     if (t !== token) return;
     const before = cart.length;
-    cart = cart.filter((l) => findItem(l.id)); // drop items removed from the menu
+    cart = cart.filter((l) => findItem(l.id));
     if (cart.length !== before) saveCart();
     paintCart();
   }
@@ -761,6 +785,10 @@
 
     const canAlert = 'Notification' in window && Notification.permission === 'default' && order.status !== 'completed';
 
+    const actionButton = order.status === 'completed'
+      ? `<a class="btn btn-primary btn-block" href="#/">Order again</a>`
+      : `<button class="btn btn-primary btn-block" id="confirm-received-btn" type="button">Order Received</button>`;
+
     return `
       <a class="back" href="#/orders">My orders</a>
       <article class="ticket${order.status === 'ready' ? ' is-ready' : ''}">
@@ -781,7 +809,7 @@
           <div class="total-row"><span>Total</span><strong>${peso(order.total)}</strong></div>
           ${order.note ? `<p class="hint">Your note: ${esc(order.note)}</p>` : ''}
           ${canAlert ? `<button class="btn btn-ghost btn-block" id="alert-btn" type="button">Alert me when it is ready</button>` : ''}
-          <a class="btn ${order.status === 'completed' ? 'btn-primary' : 'btn-ghost'} btn-block" href="#/">${order.status === 'completed' ? 'Order again' : 'Back to menu'}</a>
+          ${actionButton}
         </div>
       </article>`;
   }
@@ -794,7 +822,7 @@
       try {
         new Notification('Your order is ready', { body: `Show code ${order.code} at the ${PICKUP_POINT}.` });
       } catch (e) {
-        /* some browsers only allow notifications from a service worker */
+        /* ignore */
       }
     }
   }
@@ -809,7 +837,7 @@
       if (err.status === 404) {
         $view.innerHTML = `<a class="back" href="#/orders">My orders</a>
           <div class="empty"><h2>Order not found</h2><p>This order may be too old, or the link is incorrect.</p>
-          <a class="btn btn-primary" href="#/">Back to menu</a></div>`;
+          <a class="btn btn-primary" href="#/orders">View My Orders</a></div>`;
         return;
       }
       if (err.status === 401) {
@@ -832,6 +860,7 @@
       if (html === lastHtml) return;
       lastHtml = html;
       $view.innerHTML = html;
+
       const alertBtn = document.getElementById('alert-btn');
       if (alertBtn) {
         alertBtn.addEventListener('click', async () => {
@@ -842,6 +871,14 @@
             /* ignore */
           }
           paint(o);
+        });
+      }
+
+      const confirmBtn = document.getElementById('confirm-received-btn');
+      if (confirmBtn) {
+        confirmBtn.addEventListener('click', () => {
+          toast('Order acknowledged! Redirecting to My Orders…', 'ok');
+          location.hash = '#/orders';
         });
       }
     };
@@ -861,7 +898,7 @@
         paint(fresh);
         if (fresh.status === 'completed') clearTimers();
       } catch (e) {
-        /* keep the last known status on screen and try again */
+        /* keep last status */
       }
     }, TRACK_POLL_MS);
   }

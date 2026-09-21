@@ -1,732 +1,1375 @@
-const express = require('express');
-const fs = require('fs');
 const path = require('path');
+const fs = require('fs');
+const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
-const dns = require('dns').promises;
+const nodemailer = require('nodemailer');
+const dotenv = require('dotenv');
+
+dotenv.config();
 
 const app = express();
-app.set('trust proxy', 1); // Railway sits behind a proxy; this makes req.ip the visitor's real IP
 const PORT = process.env.PORT || 3000;
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const STAFF_PIN = process.env.STAFF_PIN || '1234';
 const STAFF_INVITE_CODE = process.env.STAFF_INVITE_CODE || '2006';
 
-// Email (Brevo HTTPS API, works on Railway; SMTP is blocked there on non-Pro plans)
-const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
-const MAIL_FROM = process.env.MAIL_FROM || ''; // must be a sender you verified inside Brevo
-const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || 'Campus Pickup';
-const MAIL_ENABLED = Boolean(BREVO_API_KEY && MAIL_FROM);
+// Gmail Transporter Setup (Nodemailer)
+const EMAIL_USER = String(process.env.EMAIL_USER || '').trim();
+const EMAIL_PASS = String(process.env.EMAIL_PASS || '').replace(/\s+/g, '').trim();
+const EMAIL_CONFIGURED = Boolean(EMAIL_USER && EMAIL_PASS);
 
-// Data directory path. On a host with a persistent volume, set DATA_DIR to its mount path (e.g. /data).
-const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
-// Uploaded food photos live inside DATA_DIR when it is set, so they survive redeploys too.
-const UPLOAD_DIR = process.env.UPLOAD_DIR
-  ? path.resolve(process.env.UPLOAD_DIR)
-  : process.env.DATA_DIR
-    ? path.join(DATA_DIR, 'uploads')
-    : path.join(__dirname, 'public', 'uploads');
-const MENU_FILE = path.join(DATA_DIR, 'menu.json');
-const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
-const SUGGESTIONS_FILE = path.join(DATA_DIR, 'suggestions.json');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const NOTIFICATIONS_FILE = path.join(DATA_DIR, 'notifications.json');
-const sessions = new Map();
+const transporter = EMAIL_CONFIGURED
+  ? nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: EMAIL_USER,
+        pass: EMAIL_PASS,
+      },
+    })
+  : null;
 
-// Fresh deploys start with no data folder and no menu.json (both are git-ignored), so create them here.
-const SEED_CANDIDATES = [
-  path.join(__dirname, 'data', 'menu.seed.json'),
-  path.join(__dirname, 'data', 'menu_seed.json'),
-  path.join(__dirname, 'menu.seed.json'),
-  path.join(__dirname, 'menu_seed.json')
-];
-const ensureDataFiles = () => {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  [ORDERS_FILE, SUGGESTIONS_FILE, USERS_FILE, NOTIFICATIONS_FILE].forEach((file) => {
-    if (!fs.existsSync(file)) fs.writeFileSync(file, '[]');
-  });
-  if (!fs.existsSync(MENU_FILE)) {
-    const seed = SEED_CANDIDATES.find((file) => fs.existsSync(file));
-    if (seed) {
-      fs.copyFileSync(seed, MENU_FILE);
-      console.log(`[info] Menu created from ${seed}`);
-    } else {
-      fs.writeFileSync(MENU_FILE, '[]');
-      console.warn('[warn] No menu seed file found, so the menu starts empty.');
-    }
+// Helper Function para magpadala ng Verification Code sa Gmail App
+async function sendVerificationEmail(toEmail, code, subjectTitle = 'Your Verification Code') {
+  if (!EMAIL_CONFIGURED || !transporter) {
+    throw new Error('Gmail email sending is not configured. Check EMAIL_USER and EMAIL_PASS in .env.');
   }
-};
-ensureDataFiles();
 
-// Middleware
+  const mailOptions = {
+    from: `"Campus Pickup" <${EMAIL_USER}>`,
+    to: toEmail,
+    subject: `${subjectTitle} - Campus Pickup`,
+    text: `Your Campus Pickup verification code is ${code}. This code expires in 10 minutes.`,
+    html: `
+      <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #e0e2ee; border-radius: 10px; max-width: 500px; margin: 0 auto;">
+        <h2 style="color: #1F1B4D; margin-bottom: 10px;">Campus Pickup</h2>
+        <p style="color: #5b5f7a; font-size: 16px;">Gawin ang hakbang na ito para ma-verify ang iyong account:</p>
+        <div style="background: #f4f5fa; padding: 15px; text-align: center; border-radius: 8px; margin: 20px 0;">
+          <h1 style="color: #0e7c45; letter-spacing: 6px; font-size: 32px; margin: 0;">${code}</h1>
+        </div>
+        <p style="color: #8b8fa8; font-size: 14px;">Ang code na ito ay mag-e-expire sa loob ng 10 minuto. Huwag ipagkaloob kanino man.</p>
+      </div>
+    `,
+  };
+
+  const info = await transporter.sendMail(mailOptions);
+  console.log(`[EMAIL] Verification email sent to ${toEmail}. Message ID: ${info.messageId}`);
+}
+
 app.use(express.json());
-app.use((req, res, next) => {
-  if (req.body === undefined) req.body = {};
-  next();
-});
-
-// 1. DITO ANG ARAW NG SOLUSYON: I-serve ang 'public' folder
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(UPLOAD_DIR));
 
-// Storage setup para sa Image Uploads ng Staff
+// File storage configuration for multer
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-    cb(null, UPLOAD_DIR);
+    const uploadPath = path.join(__dirname, 'public', 'uploads');
+    if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath, { recursive: true });
+    cb(null, uploadPath);
   },
   filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname.replace(/[^\w.\-]+/g, '_')}`);
-  }
+    const ext = path.extname(file.originalname);
+    cb(null, `food-${Date.now()}${ext}`);
+  },
 });
+
 const upload = multer({ storage });
 
-// Helper functions sa pagbabasa at pagsusulat ng JSON
-const readData = (filePath) => {
-  if (!fs.existsSync(filePath)) return [];
-  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-};
+function ensureDir(dirPath) {
+  if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
+}
 
-const writeData = (filePath, data) => {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, filePath);
-};
+ensureDir(DATA_DIR);
 
-const hashPassword = (password, salt = crypto.randomBytes(16).toString('hex')) => ({
-  salt,
-  passwordHash: crypto.scryptSync(password, salt, 64).toString('hex')
-});
+function readJson(fileName, fallback) {
+  const filePath = path.join(DATA_DIR, fileName);
+  if (!fs.existsSync(filePath)) return fallback;
 
-const passwordMatches = (password, user) => {
-  const hash = crypto.scryptSync(password, user.salt, 64).toString('hex');
-  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(user.passwordHash, 'hex'));
-};
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    return fallback;
+  }
+}
 
-const tokenFor = (user) => {
-  const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, { id: user.id, role: user.role });
-  return token;
-};
+function writeJson(fileName, data) {
+  const filePath = path.join(DATA_DIR, fileName);
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
 
-const currentUser = (req) => sessions.get(req.headers.authorization?.replace(/^Bearer\s+/i, ''));
-const requireSignedIn = (req, res, next) => {
-  const user = currentUser(req);
-  if (!user) return res.status(401).json({ error: 'Sign in required' });
+// Menu and Order Helpers
+function getMenu() {
+  const seed = path.join(__dirname, 'data', 'menu.seed.json');
+
+  if (!fs.existsSync(path.join(DATA_DIR, 'menu.json')) && fs.existsSync(seed)) {
+    fs.copyFileSync(seed, path.join(DATA_DIR, 'menu.json'));
+  }
+
+  return readJson('menu.json', []);
+}
+
+function saveMenu(menu) {
+  writeJson('menu.json', menu);
+}
+
+function getOrders() {
+  return readJson('orders.json', []);
+}
+
+function saveOrders(orders) {
+  writeJson('orders.json', orders);
+}
+
+function getUsers() {
+  return readJson('users.json', []);
+}
+
+function saveUsers(users) {
+  writeJson('users.json', users);
+}
+
+function getOTPs() {
+  return readJson('otps.json', []);
+}
+
+function saveOTPs(otps) {
+  writeJson('otps.json', otps);
+}
+
+function getSuggestions() {
+  return readJson('suggestions.json', []);
+}
+
+function saveSuggestions(suggestions) {
+  writeJson('suggestions.json', suggestions);
+}
+
+function getNotifications() {
+  return readJson('notifications.json', []);
+}
+
+function saveNotifications(notes) {
+  writeJson('notifications.json', notes);
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return { salt, hash };
+}
+
+function generateCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Auth Middleware
+function authUser(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Unauthorized access.' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  const users = getUsers();
+  const user = users.find((u) => u.token === token);
+
+  if (!user) {
+    return res.status(401).json({
+      error: 'Session expired. Please sign in again.',
+    });
+  }
+
   req.user = user;
   next();
-};
-const requireCustomerOrStaff = (req, res, next) => {
-  const user = currentUser(req);
-  if (user) {
-    req.user = user;
+}
+
+function authStaff(req, res, next) {
+  const pin = req.headers['x-staff-pin'];
+  const authHeader = req.headers.authorization;
+  const token = authHeader ? authHeader.split(' ')[1] : null;
+
+  if (pin === STAFF_PIN) {
     return next();
   }
-  if (req.headers['x-staff-pin'] === STAFF_PIN) {
-    req.user = { role: 'staff' };
-    return next();
-  }
-  return res.status(401).json({ error: 'Sign in required' });
-};
-const requireCustomer = (req, res, next) => {
-  const user = currentUser(req);
-  if (!user || user.role !== 'customer') return res.status(401).json({ error: 'Customer sign-in required' });
-  req.user = user;
-  next();
-};
-const requireStaff = (req, res, next) => {
-  const user = currentUser(req);
-  if (user?.role === 'staff' || req.headers['x-staff-pin'] === STAFF_PIN) {
-    req.user = user || { role: 'staff' };
-    return next();
-  }
-  return res.status(401).json({ error: 'Staff authorization required' });
-};
 
-const requireStaffMenuAccess = (req, res, next) => {
-  const user = currentUser(req);
-  if (user?.role === 'staff' || req.headers['x-staff-pin'] === STAFF_PIN) {
-    req.user = user || { role: 'staff' };
-    return next();
-  }
-  return res.status(401).json({ error: 'Staff authorization required' });
-};
+  if (token) {
+    const users = getUsers();
+    const staff = users.find((u) => u.token === token && u.role === 'staff');
 
-const publicUser = (user) => ({ id: user.id, name: user.name, email: user.email, role: user.role });
-
-// ==========================================
-// EMAIL VERIFICATION + PASSWORD RESET (6-digit codes sent by email)
-// ==========================================
-
-const MIN_PASSWORD = 8;
-const CODE_TTL_MS = 10 * 60 * 1000;
-const RESEND_COOLDOWN_MS = 60 * 1000;
-const MAX_CODE_ATTEMPTS = 5;
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-const pendingRegistrations = new Map(); // key: "role:email" -> details waiting for the emailed code
-const passwordResets = new Map(); // key: "role:email" -> reset code waiting to be used
-const rateBuckets = new Map();
-
-setInterval(() => {
-  const now = Date.now();
-  [pendingRegistrations, passwordResets].forEach((bucket) => {
-    for (const [key, record] of bucket) if (record.expiresAt < now) bucket.delete(key);
-  });
-  for (const [key, bucket] of rateBuckets) if (bucket.resetAt < now) rateBuckets.delete(key);
-}, 5 * 60 * 1000).unref();
-
-// Simple per-IP limit so nobody can spam the email quota or guess codes quickly.
-const limitRequests = (name, max, windowMs) => (req, res, next) => {
-  const key = `${name}:${req.ip}`;
-  const now = Date.now();
-  const bucket = rateBuckets.get(key);
-  if (!bucket || bucket.resetAt < now) {
-    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
-    return next();
-  }
-  if (bucket.count >= max) return res.status(429).json({ error: 'Too many attempts. Please wait a few minutes and try again.' });
-  bucket.count += 1;
-  next();
-};
-const codeRequestLimit = limitRequests('code-request', 30, 15 * 60 * 1000);
-const codeCheckLimit = limitRequests('code-check', 60, 15 * 60 * 1000);
-
-const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const normalizeEmail = (email) => String(email || '').toLowerCase().trim();
-const generateCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-const safeEqual = (a, b) => {
-  const x = Buffer.from(String(a));
-  const y = Buffer.from(String(b));
-  return x.length === y.length && crypto.timingSafeEqual(x, y);
-};
-const secondsLeft = (sentAt) => Math.max(1, Math.ceil((RESEND_COOLDOWN_MS - (Date.now() - sentAt)) / 1000));
-
-const sendMail = async (to, subject, text, html) => {
-  if (!MAIL_ENABLED) {
-    console.warn(`[mail] Email is not configured (set BREVO_API_KEY and MAIL_FROM). NOT sent to ${to}:\n${text}`);
-    return;
-  }
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ sender: { name: MAIL_FROM_NAME, email: MAIL_FROM }, to: [{ email: to }], subject, textContent: text, htmlContent: html }),
-    signal: AbortSignal.timeout(10000)
-  });
-  if (!response.ok) throw new Error(`Brevo responded ${response.status}: ${(await response.text()).slice(0, 300)}`);
-};
-
-const sendCodeEmail = (to, name, code, purpose) => {
-  const action = purpose === 'reset' ? 'reset your password' : 'verify your email address';
-  const subject = purpose === 'reset' ? 'Your Campus Pickup password reset code' : 'Your Campus Pickup verification code';
-  const text = `Hi ${name},\n\nUse this code to ${action}: ${code}\n\nIt expires in 10 minutes. If you did not ask for it, you can ignore this email.\n\nCampus Pickup`;
-  const html = `<div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:16px"><h2 style="margin:0 0 12px">Campus Pickup</h2><p>Hi ${escapeHtml(name)},</p><p>Use this code to ${action}:</p><p style="font-size:32px;letter-spacing:8px;font-weight:bold;margin:16px 0">${code}</p><p style="color:#555">It expires in 10 minutes. If you did not ask for it, you can ignore this email.</p></div>`;
-  return sendMail(to, subject, text, html);
-};
-
-// A made-up domain (like "asdf@notreal123.xyz") has no mail server, so we can reject it right away.
-const domainCanReceiveMail = async (domain) => {
-  const missing = (err) => err && (err.code === 'ENOTFOUND' || err.code === 'ENODATA');
-  try {
-    if ((await dns.resolveMx(domain)).length) return true;
-  } catch (err) {
-    if (!missing(err)) return true; // our DNS had a hiccup; the emailed code will still decide
-  }
-  try {
-    return (await dns.resolve4(domain)).length > 0;
-  } catch (err) {
-    return !missing(err);
-  }
-};
-
-const issueRegistrationCode = async (key, record) => {
-  record.code = generateCode();
-  record.expiresAt = Date.now() + CODE_TTL_MS;
-  record.sentAt = Date.now();
-  record.attempts = 0;
-  pendingRegistrations.set(key, record);
-  try {
-    await sendCodeEmail(record.email, record.name, record.code, 'register');
-  } catch (error) {
-    pendingRegistrations.delete(key);
-    console.error('[mail] Could not send verification email:', error.message);
-    return { status: 502, error: 'We could not send the verification email. Please try again in a moment.' };
-  }
-  return { status: 202, email: record.email, message: `We sent a 6-digit code to ${record.email}. It expires in 10 minutes.` };
-};
-
-const startRegistration = async ({ role, name, email, password }) => {
-  const normalizedEmail = normalizeEmail(email);
-  const cleanName = String(name || '').trim();
-  if (!cleanName || !normalizedEmail || !password) return { status: 400, error: 'Name, email, and password are required.' };
-  if (String(password).length < MIN_PASSWORD) return { status: 400, error: `Password must be at least ${MIN_PASSWORD} characters.` };
-  if (normalizedEmail.length > 254 || !EMAIL_PATTERN.test(normalizedEmail)) return { status: 400, error: 'Please enter a valid email address.' };
-  if (readData(USERS_FILE).some((user) => user.email === normalizedEmail)) return { status: 409, error: 'An account with that email already exists.' };
-  if (!(await domainCanReceiveMail(normalizedEmail.split('@')[1]))) return { status: 400, error: 'That email address does not look real. Please check it for typos.' };
-  const key = `${role}:${normalizedEmail}`;
-  const existing = pendingRegistrations.get(key);
-  if (existing && Date.now() - existing.sentAt < RESEND_COOLDOWN_MS) return { status: 429, error: `Please wait ${secondsLeft(existing.sentAt)} seconds before asking for another code.` };
-  return issueRegistrationCode(key, { role, name: cleanName, email: normalizedEmail, ...hashPassword(String(password)) });
-};
-
-const resendRegistration = async (role, email) => {
-  const key = `${role}:${normalizeEmail(email)}`;
-  const record = pendingRegistrations.get(key);
-  if (!record) return { status: 400, error: 'No pending registration for that email. Please register again.' };
-  if (Date.now() - record.sentAt < RESEND_COOLDOWN_MS) return { status: 429, error: `Please wait ${secondsLeft(record.sentAt)} seconds before asking for another code.` };
-  return issueRegistrationCode(key, record);
-};
-
-const finishRegistration = (role, email, code) => {
-  const key = `${role}:${normalizeEmail(email)}`;
-  const pending = pendingRegistrations.get(key);
-  if (!pending) return { status: 400, error: 'No pending registration for that email. Please register again.' };
-  if (Date.now() > pending.expiresAt) {
-    pendingRegistrations.delete(key);
-    return { status: 400, error: 'That code has expired. Please request a new one.' };
-  }
-  if (!safeEqual(pending.code, String(code || '').trim())) {
-    pending.attempts += 1;
-    if (pending.attempts >= MAX_CODE_ATTEMPTS) {
-      pendingRegistrations.delete(key);
-      return { status: 429, error: 'Too many wrong codes. Please register again.' };
+    if (staff) {
+      req.staff = staff;
+      return next();
     }
-    return { status: 400, error: 'Incorrect verification code.' };
   }
-  const users = readData(USERS_FILE);
-  if (users.some((user) => user.email === pending.email)) {
-    pendingRegistrations.delete(key);
-    return { status: 409, error: 'An account with that email already exists.' };
-  }
-  const user = { id: `${role}-${Date.now()}`, name: pending.name, email: pending.email, role, salt: pending.salt, passwordHash: pending.passwordHash, emailVerified: true, createdAt: new Date().toISOString() };
-  users.push(user);
-  writeData(USERS_FILE, users);
-  pendingRegistrations.delete(key);
-  return { status: 201, user, token: tokenFor(user) };
-};
 
-const RESET_REPLY = { message: 'If that email is registered, a 6-digit reset code has been sent. It expires in 10 minutes.' };
+  return res.status(401).json({
+    error: 'Staff access denied.',
+  });
+}
 
-// Always answers the same way, so nobody can use this form to find out which emails have accounts.
-const startPasswordReset = async (role, email) => {
-  const normalizedEmail = normalizeEmail(email);
-  if (!EMAIL_PATTERN.test(normalizedEmail)) return RESET_REPLY;
-  const user = readData(USERS_FILE).find((entry) => entry.email === normalizedEmail && entry.role === role);
-  if (!user) return RESET_REPLY;
-  const key = `${role}:${normalizedEmail}`;
-  const existing = passwordResets.get(key);
-  if (existing && Date.now() - existing.sentAt < RESEND_COOLDOWN_MS) return RESET_REPLY;
-  const record = { userId: user.id, code: generateCode(), expiresAt: Date.now() + CODE_TTL_MS, sentAt: Date.now(), attempts: 0 };
-  passwordResets.set(key, record);
+// ESTIMATE TIME FORMULA
+function estimateMinutes(items, queueDelay) {
+  const longest = Math.max(...items.map((i) => i.prepMinutes || 5));
+  const totalQty = items.reduce((sum, i) => sum + i.qty, 0);
+
+  return longest + Math.ceil((totalQty - 1) / 2) + (queueDelay || 0);
+}
+
+/* API ROUTES */
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function isGmailAddress(email) {
+  return /@gmail\.com$/i.test(email);
+}
+
+// 1. AUTH ROUTES
+
+app.post('/api/auth/register', async (req, res) => {
   try {
-    await sendCodeEmail(user.email, user.name, record.code, 'reset');
-  } catch (error) {
-    passwordResets.delete(key);
-    console.error('[mail] Could not send reset email:', error.message);
-  }
-  return RESET_REPLY;
-};
+    const { name, email, password } = req.body;
 
-const finishPasswordReset = (role, email, code, password) => {
-  if (String(password || '').length < MIN_PASSWORD) return { status: 400, error: `Password must be at least ${MIN_PASSWORD} characters.` };
-  const key = `${role}:${normalizeEmail(email)}`;
-  const record = passwordResets.get(key);
-  if (!record || Date.now() > record.expiresAt) {
-    passwordResets.delete(key);
-    return { status: 400, error: 'That code is invalid or has expired. Please request a new one.' };
-  }
-  if (!safeEqual(record.code, String(code || '').trim())) {
-    record.attempts += 1;
-    if (record.attempts >= MAX_CODE_ATTEMPTS) {
-      passwordResets.delete(key);
-      return { status: 429, error: 'Too many wrong codes. Please request a new one.' };
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        error: 'All fields are required.',
+      });
     }
-    return { status: 400, error: 'Incorrect reset code.' };
+
+    if (String(password).length < 8) {
+      return res.status(400).json({
+        error: 'Password must be at least 8 characters.',
+      });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+
+    if (!isValidEmail(cleanEmail)) {
+      return res.status(400).json({
+        error: 'Please enter a valid email address.',
+      });
+    }
+
+    if (!isGmailAddress(cleanEmail)) {
+      return res.status(400).json({
+        error: 'Please use a Gmail address (@gmail.com).',
+      });
+    }
+
+    const users = getUsers();
+
+    if (users.find((u) => u.email === cleanEmail)) {
+      return res.status(400).json({
+        error: 'Email is already registered.',
+      });
+    }
+
+    if (!EMAIL_CONFIGURED) {
+      return res.status(503).json({
+        error: 'Email service is not configured on the server.',
+      });
+    }
+
+    const code = generateCode();
+    const { salt, hash } = hashPassword(password);
+
+    // Send email first.
+    // The OTP is saved only if Gmail accepts the email.
+    await sendVerificationEmail(
+      cleanEmail,
+      code,
+      'Verify Your Student Account'
+    );
+
+    const otps = getOTPs().filter(
+      (o) => o.email !== cleanEmail
+    );
+
+    otps.push({
+      email: cleanEmail,
+      code,
+      name,
+      salt,
+      hash,
+      role: 'customer',
+      expiresAt: Date.now() + 600000,
+    });
+
+    saveOTPs(otps);
+
+    res.json({
+      message: 'Verification code sent to your email.',
+      email: cleanEmail,
+    });
+  } catch (err) {
+    console.error(
+      '[REGISTER] Email send failed:',
+      err.message
+    );
+
+    res.status(502).json({
+      error: 'Could not send the verification email. Please try again.',
+    });
   }
-  const users = readData(USERS_FILE);
-  const index = users.findIndex((entry) => entry.id === record.userId && entry.role === role);
-  if (index === -1) {
-    passwordResets.delete(key);
-    return { status: 400, error: 'That code is invalid or has expired. Please request a new one.' };
+});
+
+// RESEND CUSTOMER OTP
+app.post('/api/auth/register/resend', async (req, res) => {
+  try {
+    const cleanEmail = String(req.body.email || '')
+      .trim()
+      .toLowerCase();
+
+    if (!isValidEmail(cleanEmail)) {
+      return res.status(400).json({
+        error: 'Please enter a valid email address.',
+      });
+    }
+
+    const otps = getOTPs();
+
+    const existing = otps.find(
+      (o) =>
+        o.email === cleanEmail &&
+        o.role === 'customer'
+    );
+
+    if (!existing) {
+      return res.status(400).json({
+        error: 'No pending registration found for this email.',
+      });
+    }
+
+    if (!EMAIL_CONFIGURED) {
+      return res.status(503).json({
+        error: 'Email service is not configured on the server.',
+      });
+    }
+
+    const code = generateCode();
+
+    await sendVerificationEmail(
+      cleanEmail,
+      code,
+      'Your New Student Verification Code'
+    );
+
+    existing.code = code;
+    existing.expiresAt = Date.now() + 600000;
+
+    saveOTPs(otps);
+
+    res.json({
+      message: 'A new verification code was sent to your email.',
+      email: cleanEmail,
+    });
+  } catch (err) {
+    console.error(
+      '[RESEND] Email send failed:',
+      err.message
+    );
+
+    res.status(502).json({
+      error: 'Could not resend the verification email. Please try again.',
+    });
   }
-  Object.assign(users[index], hashPassword(String(password)));
-  writeData(USERS_FILE, users);
-  passwordResets.delete(key);
-  for (const [token, session] of sessions) if (session.id === users[index].id) sessions.delete(token); // sign out everywhere
-  return { status: 200 };
-};
-
-const replyPending = (res, result) => {
-  if (result.error) return res.status(result.status).json({ error: result.error });
-  res.status(202).json({ verificationRequired: true, email: result.email, message: result.message });
-};
-const replyCreated = (res, result) => {
-  if (result.error) return res.status(result.status).json({ error: result.error });
-  res.status(201).json({ token: result.token, user: publicUser(result.user) });
-};
-
-const loginUser = (email, password, role) => {
-  const user = readData(USERS_FILE).find((entry) => entry.email === String(email || '').toLowerCase().trim() && entry.role === role);
-  if (!user || !passwordMatches(String(password || ''), user)) return null;
-  return { user, token: tokenFor(user) };
-};
-
-app.post('/api/auth/staff/register', codeRequestLimit, async (req, res) => {
-  if (!safeEqual(String(req.body.inviteCode || '').trim(), STAFF_INVITE_CODE)) return res.status(403).json({ error: 'Valid staff verification code required.' });
-  replyPending(res, await startRegistration({ role: 'staff', name: req.body.name, email: req.body.email, password: req.body.password }));
 });
 
-app.post('/api/auth/staff/register/resend', codeRequestLimit, async (req, res) => {
-  replyPending(res, await resendRegistration('staff', req.body.email));
-});
+// VERIFY CUSTOMER OTP
+app.post('/api/auth/register/verify', (req, res) => {
+  const { email, code } = req.body;
 
-app.post('/api/auth/staff/register/verify', codeCheckLimit, (req, res) => {
-  replyCreated(res, finishRegistration('staff', req.body.email, req.body.code));
-});
+  const cleanEmail = email.trim().toLowerCase();
 
-app.post('/api/auth/staff/login', (req, res) => {
-  const result = loginUser(req.body.email, req.body.password, 'staff');
-  if (!result) return res.status(401).json({ error: 'Invalid staff email or password.' });
-  res.json({ token: result.token, user: publicUser(result.user) });
-});
+  const otps = getOTPs();
 
-app.post('/api/auth/staff/forgot-password', codeRequestLimit, async (req, res) => {
-  res.json(await startPasswordReset('staff', req.body.email));
-});
+  const otp = otps.find(
+    (o) =>
+      o.email === cleanEmail &&
+      o.code === code &&
+      o.expiresAt > Date.now()
+  );
 
-app.post('/api/auth/staff/reset-password', codeCheckLimit, (req, res) => {
-  const result = finishPasswordReset('staff', req.body.email, req.body.code, req.body.password);
-  if (result.error) return res.status(result.status).json({ error: result.error });
-  res.json({ message: 'Password changed. You can now sign in.' });
-});
-
-app.post('/api/auth/staff/logout', (req, res) => {
-  sessions.delete(req.headers.authorization?.replace(/^Bearer\s+/i, ''));
-  res.json({ message: 'Staff signed out' });
-});
-
-app.get('/api/auth/staff/me', (req, res) => {
-  const session = currentUser(req);
-  const user = session && session.role === 'staff' && readData(USERS_FILE).find((entry) => entry.id === session.id);
-  if (!user) return res.status(401).json({ error: 'Staff sign-in required' });
-  res.json({ user: publicUser(user) });
-});
-
-app.get('/api/staff/profile', requireStaff, (req, res) => {
-  if (!req.user.id) return res.json({ user: { name: 'Canteen staff', email: '', role: 'staff' } });
-  const user = readData(USERS_FILE).find((entry) => entry.id === req.user.id && entry.role === 'staff');
-  if (!user) return res.status(404).json({ error: 'Staff profile not found' });
-  res.json({ user: publicUser(user) });
-});
-
-app.patch('/api/staff/profile', requireStaff, (req, res) => {
-  if (!req.user.id) return res.status(400).json({ error: 'A verified staff account is required to edit the profile.' });
-  const users = readData(USERS_FILE);
-  const index = users.findIndex((entry) => entry.id === req.user.id && entry.role === 'staff');
-  if (index === -1) return res.status(404).json({ error: 'Staff profile not found' });
-  const name = String(req.body.name || '').trim();
-  const email = String(req.body.email || '').toLowerCase().trim();
-  if (!name || !email) return res.status(400).json({ error: 'Name and email are required.' });
-  if (users.some((entry, userIndex) => userIndex !== index && entry.email === email)) return res.status(409).json({ error: 'That email is already in use.' });
-  users[index].name = name;
-  users[index].email = email;
-  writeData(USERS_FILE, users);
-  res.json({ user: publicUser(users[index]) });
-});
-
-const staffAuthMiddleware = (req, res, next) => {
-  const user = currentUser(req);
-  if (user?.role === 'staff') {
-    req.user = user;
-    return next();
+  if (!otp) {
+    return res.status(400).json({
+      error: 'Invalid or expired verification code.',
+    });
   }
-  if (req.headers['x-staff-pin'] === STAFF_PIN) {
-    req.user = { role: 'staff' };
-    return next();
-  }
-  return res.status(401).json({ error: 'Staff authorization required' });
-};
 
-const checkStaffPin = (req, res, next) => {
-  if (req.headers['x-staff-pin'] !== STAFF_PIN) return res.status(401).json({ error: 'Staff authorization required' });
-  req.user = { role: 'staff' };
-  next();
-};
+  const users = getUsers();
 
-const pushNotification = (recipient, title, message, type = 'info') => {
-  const notifications = readData(NOTIFICATIONS_FILE);
-  notifications.unshift({ id: `note-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`, recipient, title, message, type, read: false, createdAt: new Date().toISOString() });
-  writeData(NOTIFICATIONS_FILE, notifications.slice(0, 200));
-};
+  const newUser = {
+    id: 'usr-' + Date.now(),
+    name: otp.name,
+    email: cleanEmail,
+    salt: otp.salt,
+    hash: otp.hash,
+    role: otp.role || 'customer',
+    createdAt: new Date().toISOString(),
+  };
 
-// ==========================================
-// API ROUTES
-// ==========================================
+  users.push(newUser);
 
-app.post('/api/auth/register', codeRequestLimit, async (req, res) => {
-  const { name, email, password } = req.body;
-  replyPending(res, await startRegistration({ role: 'customer', name, email, password }));
+  saveUsers(users);
+
+  saveOTPs(
+    otps.filter((o) => o.email !== cleanEmail)
+  );
+
+  res.json({
+    message: 'Account created successfully! You can now sign in.',
+  });
 });
 
-app.post('/api/auth/register/resend', codeRequestLimit, async (req, res) => {
-  replyPending(res, await resendRegistration('customer', req.body.email));
-});
-
-app.post('/api/auth/register/verify', codeCheckLimit, (req, res) => {
-  replyCreated(res, finishRegistration('customer', req.body.email, req.body.code));
-});
-
+// LOGIN
 app.post('/api/auth/login', (req, res) => {
-  const user = readData(USERS_FILE).find((entry) => entry.email === String(req.body.email || '').toLowerCase().trim() && entry.role === 'customer');
-  if (!user || !passwordMatches(String(req.body.password || ''), user)) return res.status(401).json({ error: 'Invalid email or password.' });
-  res.json({ token: tokenFor(user), user: { id: user.id, name: user.name, email: user.email, role: user.role } });
-});
+  const { email, password } = req.body;
 
-app.post('/api/auth/forgot-password', codeRequestLimit, async (req, res) => {
-  res.json(await startPasswordReset('customer', req.body.email));
-});
+  const cleanEmail = email.trim().toLowerCase();
 
-app.post('/api/auth/reset-password', codeCheckLimit, (req, res) => {
-  const result = finishPasswordReset('customer', req.body.email, req.body.code, req.body.password);
-  if (result.error) return res.status(result.status).json({ error: result.error });
-  res.json({ message: 'Password changed. You can now sign in.' });
-});
+  const users = getUsers();
 
-app.get('/api/auth/me', (req, res) => {
-  const session = currentUser(req);
-  const user = session && readData(USERS_FILE).find((entry) => entry.id === session.id);
-  if (!user) return res.status(401).json({ error: 'Not signed in' });
-  res.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role } });
-});
+  const user = users.find(
+    (u) => u.email === cleanEmail
+  );
 
-app.post('/api/auth/logout', (req, res) => {
-  sessions.delete(req.headers.authorization?.replace(/^Bearer\s+/i, ''));
-  res.json({ message: 'Signed out' });
-});
-
-app.post('/api/staff/login', (req, res) => {
-  if (req.headers['x-staff-pin'] !== STAFF_PIN) return res.status(401).json({ error: 'Incorrect staff PIN.' });
-  res.json({ user: { name: 'Canteen staff', role: 'staff' } });
-});
-
-app.get('/api/notifications', requireSignedIn, (req, res) => {
-  const recipient = req.user.role === 'customer' ? req.user.id : 'staff';
-  res.json({ notifications: readData(NOTIFICATIONS_FILE).filter((note) => note.recipient === recipient || note.recipient === 'all').slice(0, 30) });
-});
-
-app.patch('/api/notifications/:id/read', requireSignedIn, (req, res) => {
-  const notifications = readData(NOTIFICATIONS_FILE);
-  const index = notifications.findIndex((note) => note.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: 'Notification not found' });
-  if (notifications[index].recipient !== req.user.id && notifications[index].recipient !== req.user.role && notifications[index].recipient !== 'all') return res.status(403).json({ error: 'Notification access denied' });
-  notifications[index].read = true;
-  writeData(NOTIFICATIONS_FILE, notifications);
-  res.json({ notification: notifications[index] });
-});
-
-// Get Menu
-app.get('/api/menu', requireCustomerOrStaff, (req, res) => {
-  res.json({ items: readData(MENU_FILE) });
-});
-
-// Admin: Add Food Item with Image Upload
-app.post('/api/admin/menu', requireStaff, upload.single('foodImage'), (req, res) => {
-  const menu = readData(MENU_FILE);
-  const { name, category, price, prepMinutes, description } = req.body;
-  if (!name || !category || !description || !Number.isFinite(Number(price)) || !Number.isFinite(Number(prepMinutes))) {
-    return res.status(400).json({ error: 'Name, category, price, preparation time, and description are required.' });
+  if (!user) {
+    return res.status(400).json({
+      error: 'Invalid email or password.',
+    });
   }
-  if (!req.file) return res.status(400).json({ error: 'A food picture is required when adding a new item.' });
 
-  const imageUrl = req.file 
-    ? `/uploads/${req.file.filename}` 
-    : '/images/default-food.jpg';
+  const { hash } = hashPassword(
+    password,
+    user.salt
+  );
 
-  const newItem = {
-    id: name.toLowerCase().replace(/\s+/g, '-'),
-    name,
-    category,
-    price: Number(price),
-    prepMinutes: Number(prepMinutes),
-    available: true,
-    description,
-    imageUrl
-  };
+  if (hash !== user.hash) {
+    return res.status(400).json({
+      error: 'Invalid email or password.',
+    });
+  }
 
-  menu.push(newItem);
-  writeData(MENU_FILE, menu);
-  res.status(201).json({ message: "Food added successfully!", item: newItem });
-});
+  const token = crypto
+    .randomBytes(32)
+    .toString('hex');
 
-// Admin: Update Food Item
-app.put('/api/admin/menu/:id', requireStaff, upload.single('foodImage'), (req, res) => {
-  let menu = readData(MENU_FILE);
-  const index = menu.findIndex(item => item.id === req.params.id);
+  user.token = token;
 
-  if (index === -1) return res.status(404).json({ error: "Item not found" });
+  saveUsers(users);
 
-  menu[index] = {
-    ...menu[index],
-    ...req.body,
-    price: Number(req.body.price),
-    prepMinutes: Number(req.body.prepMinutes),
-    imageUrl: req.file ? `/uploads/${req.file.filename}` : menu[index].imageUrl,
-  };
-  writeData(MENU_FILE, menu);
-  res.json({ message: "Food updated successfully", item: menu[index] });
-});
-
-// Admin: Delete Food Item
-app.delete('/api/admin/menu/:id', requireStaff, (req, res) => {
-  let menu = readData(MENU_FILE);
-  const updatedMenu = menu.filter(item => item.id !== req.params.id);
-  writeData(MENU_FILE, updatedMenu);
-  res.json({ message: "Food deleted successfully" });
-});
-
-// Get Orders
-app.get('/api/orders', requireCustomer, (req, res) => {
-  const ids = String(req.query.ids || '').split(',').filter(Boolean);
-  const orders = readData(ORDERS_FILE);
-  res.json({ orders: ids.length ? orders.filter((order) => ids.includes(order.id) && order.customerId === req.user.id) : orders.filter((order) => order.customerId === req.user.id) });
-});
-
-app.get('/api/queue', requireCustomer, (req, res) => {
-  const waiting = readData(ORDERS_FILE).filter((order) => ['received', 'preparing'].includes(order.status));
-  res.json({ queueDelayMinutes: Math.min(waiting.length, 10) });
-});
-
-app.post('/api/orders', requireCustomer, (req, res) => {
-  const menu = readData(MENU_FILE);
-  const { customerName, note, items } = req.body;
-  if (!customerName || !Array.isArray(items) || !items.length) return res.status(400).json({ error: 'A name and at least one item are required.' });
-  const lines = items.map((line) => {
-    const item = menu.find((entry) => entry.id === line.id);
-    if (!item || !item.available) return null;
-    const qty = Math.max(1, Math.min(10, Number(line.qty) || 1));
-    return { id: item.id, name: item.name, emoji: item.emoji, price: item.price, qty, prepMinutes: item.prepMinutes };
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+    },
   });
-  if (lines.some((line) => !line)) return res.status(409).json({ error: 'One or more items are no longer available.' });
-  const orders = readData(ORDERS_FILE);
-  const estimatedMinutes = Math.max(...lines.map((line) => line.prepMinutes)) + Math.ceil((lines.reduce((sum, line) => sum + line.qty, 0) - 1) / 2) + Math.min(orders.filter((order) => ['received', 'preparing'].includes(order.status)).length, 10);
-  const order = { id: crypto.randomBytes(5).toString('hex'), code: `A${100 + orders.length + 1}`, customerId: currentUser(req)?.id || null, customerName: String(customerName).trim(), note: String(note || '').trim(), items: lines, total: lines.reduce((sum, line) => sum + line.price * line.qty, 0), status: 'received', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), estimatedMinutes, estimatedReadyAt: new Date(Date.now() + estimatedMinutes * 60000).toISOString(), history: [{ status: 'received', at: new Date().toISOString() }] };
+});
+
+// FORGOT PASSWORD
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    const cleanEmail = String(email || '')
+      .trim()
+      .toLowerCase();
+
+    const users = getUsers();
+
+    const user = users.find(
+      (u) => u.email === cleanEmail
+    );
+
+    if (!user) {
+      return res.status(400).json({
+        error: 'No account found with that email.',
+      });
+    }
+
+    if (!EMAIL_CONFIGURED) {
+      return res.status(503).json({
+        error: 'Email service is not configured on the server.',
+      });
+    }
+
+    const code = generateCode();
+
+    await sendVerificationEmail(
+      cleanEmail,
+      code,
+      'Reset Your Password'
+    );
+
+    const otps = getOTPs().filter(
+      (o) => o.email !== cleanEmail
+    );
+
+    otps.push({
+      email: cleanEmail,
+      code,
+      expiresAt: Date.now() + 600000,
+      type: 'reset',
+    });
+
+    saveOTPs(otps);
+
+    res.json({
+      message: 'Password reset code sent to your email.',
+    });
+  } catch (err) {
+    console.error(
+      '[FORGOT PASSWORD] Email send failed:',
+      err.message
+    );
+
+    res.status(502).json({
+      error: 'Could not send the password reset email. Please try again.',
+    });
+  }
+});
+
+// RESET PASSWORD
+app.post('/api/auth/reset-password', (req, res) => {
+  const { email, code, password } = req.body;
+
+  const cleanEmail = email.trim().toLowerCase();
+
+  const otps = getOTPs();
+
+  const otp = otps.find(
+    (o) =>
+      o.email === cleanEmail &&
+      o.code === code &&
+      o.expiresAt > Date.now()
+  );
+
+  if (!otp) {
+    return res.status(400).json({
+      error: 'Invalid or expired code.',
+    });
+  }
+
+  const users = getUsers();
+
+  const user = users.find(
+    (u) => u.email === cleanEmail
+  );
+
+  if (!user) {
+    return res.status(400).json({
+      error: 'User not found.',
+    });
+  }
+
+  const { salt, hash } = hashPassword(password);
+
+  user.salt = salt;
+  user.hash = hash;
+
+  saveUsers(users);
+
+  saveOTPs(
+    otps.filter((o) => o.email !== cleanEmail)
+  );
+
+  res.json({
+    message: 'Password reset successfully.',
+  });
+});
+
+// CURRENT USER
+app.get('/api/auth/me', authUser, (req, res) => {
+  res.json({
+    user: {
+      id: req.user.id,
+      name: req.user.name,
+      email: req.user.email,
+      role: req.user.role,
+    },
+  });
+});
+
+// LOGOUT
+app.post('/api/auth/logout', authUser, (req, res) => {
+  const users = getUsers();
+
+  const user = users.find(
+    (u) => u.id === req.user.id
+  );
+
+  if (user) {
+    delete user.token;
+  }
+
+  saveUsers(users);
+
+  res.json({
+    message: 'Signed out.',
+  });
+});
+
+// STAFF AUTH ROUTES
+
+app.post('/api/auth/staff/register', async (req, res) => {
+  try {
+    const {
+      name,
+      email,
+      password,
+      inviteCode,
+    } = req.body;
+
+    if (inviteCode !== STAFF_INVITE_CODE) {
+      return res.status(400).json({
+        error: 'Invalid staff verification code.',
+      });
+    }
+
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        error: 'All fields are required.',
+      });
+    }
+
+    const cleanEmail = String(email)
+      .trim()
+      .toLowerCase();
+
+    if (!isValidEmail(cleanEmail)) {
+      return res.status(400).json({
+        error: 'Please enter a valid email address.',
+      });
+    }
+
+    const users = getUsers();
+
+    if (users.find((u) => u.email === cleanEmail)) {
+      return res.status(400).json({
+        error: 'Email already registered.',
+      });
+    }
+
+    if (!EMAIL_CONFIGURED) {
+      return res.status(503).json({
+        error: 'Email service is not configured on the server.',
+      });
+    }
+
+    const code = generateCode();
+
+    const { salt, hash } = hashPassword(password);
+
+    await sendVerificationEmail(
+      cleanEmail,
+      code,
+      'Verify Staff Account'
+    );
+
+    const otps = getOTPs().filter(
+      (o) => o.email !== cleanEmail
+    );
+
+    otps.push({
+      email: cleanEmail,
+      code,
+      name,
+      salt,
+      hash,
+      role: 'staff',
+      expiresAt: Date.now() + 600000,
+    });
+
+    saveOTPs(otps);
+
+    res.json({
+      message: 'Staff verification code sent to email.',
+      email: cleanEmail,
+    });
+  } catch (err) {
+    console.error(
+      '[STAFF REGISTER] Email send failed:',
+      err.message
+    );
+
+    res.status(502).json({
+      error: 'Could not send the staff verification email. Please try again.',
+    });
+  }
+});
+
+// VERIFY STAFF REGISTRATION
+app.post('/api/auth/staff/register/verify', (req, res) => {
+  const { email, code } = req.body;
+
+  const cleanEmail = email.trim().toLowerCase();
+
+  const otps = getOTPs();
+
+  const otp = otps.find(
+    (o) =>
+      o.email === cleanEmail &&
+      o.code === code &&
+      o.expiresAt > Date.now()
+  );
+
+  if (!otp) {
+    return res.status(400).json({
+      error: 'Invalid or expired code.',
+    });
+  }
+
+  const users = getUsers();
+
+  const newStaff = {
+    id: 'stf-' + Date.now(),
+    name: otp.name,
+    email: cleanEmail,
+    salt: otp.salt,
+    hash: otp.hash,
+    role: 'staff',
+    createdAt: new Date().toISOString(),
+  };
+
+  users.push(newStaff);
+
+  saveUsers(users);
+
+  saveOTPs(
+    otps.filter((o) => o.email !== cleanEmail)
+  );
+
+  res.json({
+    message: 'Staff account created successfully.',
+  });
+});
+
+// STAFF LOGIN
+app.post('/api/auth/staff/login', (req, res) => {
+  const { email, password } = req.body;
+
+  const cleanEmail = email.trim().toLowerCase();
+
+  const users = getUsers();
+
+  const staff = users.find(
+    (u) =>
+      u.email === cleanEmail &&
+      u.role === 'staff'
+  );
+
+  if (!staff) {
+    return res.status(400).json({
+      error: 'Invalid staff credentials.',
+    });
+  }
+
+  const { hash } = hashPassword(
+    password,
+    staff.salt
+  );
+
+  if (hash !== staff.hash) {
+    return res.status(400).json({
+      error: 'Invalid staff credentials.',
+    });
+  }
+
+  const token = crypto
+    .randomBytes(32)
+    .toString('hex');
+
+  staff.token = token;
+
+  saveUsers(users);
+
+  res.json({
+    token,
+    user: {
+      id: staff.id,
+      name: staff.name,
+      email: staff.email,
+      role: 'staff',
+    },
+  });
+});
+
+// STAFF PROFILE
+app.get('/api/staff/profile', authStaff, (req, res) => {
+  if (req.staff) {
+    return res.json({
+      user: {
+        name: req.staff.name,
+        email: req.staff.email,
+      },
+    });
+  }
+
+  res.json({
+    user: {
+      name: 'Staff Administrator',
+      email: 'canteen.staff@campus.edu',
+    },
+  });
+});
+
+// UPDATE STAFF PROFILE
+app.patch('/api/staff/profile', authStaff, (req, res) => {
+  const { name, email } = req.body;
+
+  if (req.staff) {
+    const users = getUsers();
+
+    const staff = users.find(
+      (u) => u.id === req.staff.id
+    );
+
+    if (staff) {
+      if (name) {
+        staff.name = name.trim();
+      }
+
+      if (email) {
+        staff.email = email.trim().toLowerCase();
+      }
+
+      saveUsers(users);
+    }
+  }
+
+  res.json({
+    message: 'Profile updated.',
+  });
+});
+
+// MENU & ORDERS ROUTES
+
+app.get('/api/menu', (req, res) => {
+  res.json({
+    items: getMenu(),
+  });
+});
+
+app.get('/api/queue', (req, res) => {
+  const orders = getOrders();
+
+  const waiting = orders.filter(
+    (o) =>
+      o.status === 'received' ||
+      o.status === 'preparing'
+  );
+
+  res.json({
+    queueDelayMinutes: waiting.length,
+  });
+});
+
+// CREATE ORDER
+app.post('/api/orders', (req, res) => {
+  const {
+    customerName,
+    note,
+    items,
+  } = req.body;
+
+  if (
+    !customerName ||
+    !items ||
+    !items.length
+  ) {
+    return res.status(400).json({
+      error: 'Please include items and your name.',
+    });
+  }
+
+  const menu = getMenu();
+
+  let total = 0;
+
+  const orderItems = [];
+
+  for (const line of items) {
+    const menuItem = menu.find(
+      (m) => m.id === line.id
+    );
+
+    if (!menuItem || !menuItem.available) {
+      return res.status(409).json({
+        error: `${
+          menuItem
+            ? menuItem.name
+            : 'An item'
+        } is sold out.`,
+      });
+    }
+
+    total += menuItem.price * line.qty;
+
+    orderItems.push({
+      id: menuItem.id,
+      name: menuItem.name,
+      price: menuItem.price,
+      prepMinutes: menuItem.prepMinutes,
+      qty: line.qty,
+    });
+  }
+
+  const orders = getOrders();
+
+  const waiting = orders.filter(
+    (o) =>
+      o.status === 'received' ||
+      o.status === 'preparing'
+  );
+
+  const prepMins = estimateMinutes(
+    orderItems,
+    waiting.length
+  );
+
+  const order = {
+    id: 'ord-' + Date.now(),
+
+    code:
+      'A' +
+      Math.floor(
+        100 + Math.random() * 900
+      ),
+
+    customerName,
+
+    note: note || '',
+
+    items: orderItems,
+
+    total,
+
+    status: 'received',
+
+    createdAt:
+      new Date().toISOString(),
+
+    estimatedReadyAt:
+      new Date(
+        Date.now() +
+        prepMins * 60000
+      ).toISOString(),
+
+    history: [
+      {
+        status: 'received',
+        at: new Date().toISOString(),
+      },
+    ],
+  };
+
   orders.unshift(order);
-  writeData(ORDERS_FILE, orders);
-  pushNotification('staff', 'New order received', `${order.code} from ${order.customerName} is ready to prepare.`, 'order');
-  res.status(201).json({ order });
+
+  saveOrders(orders);
+
+  res.json({
+    order,
+  });
 });
 
+// GET SINGLE ORDER
 app.get('/api/orders/:id', (req, res) => {
-  const order = readData(ORDERS_FILE).find((entry) => entry.id === req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  const user = currentUser(req);
-  if (!user || (user.role !== 'staff' && order.customerId !== user.id)) return res.status(401).json({ error: 'Sign in required to view this order' });
-  res.json({ order });
+  const orders = getOrders();
+
+  const order = orders.find(
+    (o) => o.id === req.params.id
+  );
+
+  if (!order) {
+    return res.status(404).json({
+      error: 'Order not found.',
+    });
+  }
+
+  const waiting = orders.filter(
+    (o) =>
+      (
+        o.status === 'received' ||
+        o.status === 'preparing'
+      ) &&
+      new Date(o.createdAt) <
+        new Date(order.createdAt)
+  );
+
+  res.json({
+    order: {
+      ...order,
+      ordersAhead: waiting.length,
+    },
+  });
 });
 
-app.get('/api/staff/orders', requireStaff, (req, res) => {
-  res.json({ orders: readData(ORDERS_FILE), serverTime: new Date().toISOString() });
+// GET MULTIPLE ORDERS
+app.get('/api/orders', (req, res) => {
+  const ids = req.query.ids
+    ? req.query.ids.split(',')
+    : [];
+
+  const orders = getOrders().filter(
+    (o) => ids.includes(o.id)
+  );
+
+  res.json({
+    orders,
+  });
 });
 
-app.patch('/api/staff/orders/:id', requireStaff, (req, res) => {
-  const orders = readData(ORDERS_FILE);
-  const index = orders.findIndex((order) => order.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: 'Order not found' });
-  const allowed = ['received', 'preparing', 'ready', 'completed'];
-  if (!allowed.includes(req.body.status)) return res.status(400).json({ error: 'Invalid order status' });
-  orders[index].status = req.body.status;
-  orders[index].updatedAt = new Date().toISOString();
-  orders[index].history.push({ status: req.body.status, at: orders[index].updatedAt });
-  writeData(ORDERS_FILE, orders);
-  res.json({ order: orders[index] });
-});
+// STAFF ORDER MANAGEMENT
 
-app.patch('/api/staff/menu/:id', requireStaff, (req, res) => {
-  const menu = readData(MENU_FILE);
-  const item = menu.find((entry) => entry.id === req.params.id);
-  if (!item) return res.status(404).json({ error: 'Item not found' });
-  item.available = Boolean(req.body.available);
-  writeData(MENU_FILE, menu);
-  res.json({ item });
-});
+app.get(
+  '/api/staff/orders',
+  authStaff,
+  (req, res) => {
+    const orders = getOrders().filter(
+      (o) =>
+        o.status !== 'completed' ||
+        Date.now() -
+          new Date(o.createdAt).getTime() <
+          86400000
+    );
 
-// Customer: Suggestions API
-app.post('/api/suggestions', requireCustomer, (req, res) => {
-  const suggestions = readData(SUGGESTIONS_FILE);
-  const { customerName, foodName, category, reason } = req.body;
+    res.json({
+      orders,
+      serverTime:
+        new Date().toISOString(),
+    });
+  }
+);
 
-  const newSuggestion = {
-    id: `sug-${Date.now()}`,
-    customerId: req.user.id,
-    customerName: customerName || req.user.name || 'Student',
+// UPDATE ORDER STATUS
+app.patch(
+  '/api/staff/orders/:id',
+  authStaff,
+  (req, res) => {
+    const { status } = req.body;
+
+    const orders = getOrders();
+
+    const order = orders.find(
+      (o) => o.id === req.params.id
+    );
+
+    if (!order) {
+      return res.status(404).json({
+        error: 'Order not found.',
+      });
+    }
+
+    order.status = status;
+
+    order.history.push({
+      status,
+      at: new Date().toISOString(),
+    });
+
+    saveOrders(orders);
+
+    res.json({
+      order,
+    });
+  }
+);
+
+// UPDATE MENU AVAILABILITY
+app.patch(
+  '/api/staff/menu/:id',
+  authStaff,
+  (req, res) => {
+    const { available } = req.body;
+
+    const menu = getMenu();
+
+    const item = menu.find(
+      (m) => m.id === req.params.id
+    );
+
+    if (!item) {
+      return res.status(404).json({
+        error: 'Item not found.',
+      });
+    }
+
+    item.available = available;
+
+    saveMenu(menu);
+
+    res.json({
+      item,
+    });
+  }
+);
+
+// BREAD ADMIN MENU ROUTES
+
+// ADD MENU ITEM
+app.post(
+  '/api/admin/menu',
+  authStaff,
+  upload.single('foodImage'),
+  (req, res) => {
+    const {
+      name,
+      category,
+      price,
+      prepMinutes,
+      description,
+    } = req.body;
+
+    const menu = getMenu();
+
+    const newItem = {
+      id: 'food-' + Date.now(),
+      name,
+      category,
+      price: Number(price),
+      prepMinutes: Number(prepMinutes),
+      description,
+      available: true,
+      imageUrl: req.file
+        ? `/uploads/${req.file.filename}`
+        : '',
+    };
+
+    menu.push(newItem);
+
+    saveMenu(menu);
+
+    res.json({
+      item: newItem,
+    });
+  }
+);
+
+// UPDATE MENU ITEM
+app.put(
+  '/api/admin/menu/:id',
+  authStaff,
+  upload.single('foodImage'),
+  (req, res) => {
+    const {
+      name,
+      category,
+      price,
+      prepMinutes,
+      description,
+    } = req.body;
+
+    const menu = getMenu();
+
+    const item = menu.find(
+      (m) => m.id === req.params.id
+    );
+
+    if (!item) {
+      return res.status(404).json({
+        error: 'Food item not found.',
+      });
+    }
+
+    if (name) {
+      item.name = name;
+    }
+
+    if (category) {
+      item.category = category;
+    }
+
+    if (price) {
+      item.price = Number(price);
+    }
+
+    if (prepMinutes) {
+      item.prepMinutes =
+        Number(prepMinutes);
+    }
+
+    if (description) {
+      item.description =
+        description;
+    }
+
+    if (req.file) {
+      item.imageUrl =
+        `/uploads/${req.file.filename}`;
+    }
+
+    saveMenu(menu);
+
+    res.json({
+      item,
+    });
+  }
+);
+
+// DELETE MENU ITEM
+app.delete(
+  '/api/admin/menu/:id',
+  authStaff,
+  (req, res) => {
+    let menu = getMenu();
+
+    menu = menu.filter(
+      (m) => m.id !== req.params.id
+    );
+
+    saveMenu(menu);
+
+    res.json({
+      message: 'Food item deleted.',
+    });
+  }
+);
+
+// SUGGESTIONS & NOTIFICATIONS
+
+app.get(
+  '/api/suggestions',
+  authStaff,
+  (req, res) => {
+    res.json({
+      suggestions:
+        getSuggestions(),
+    });
+  }
+);
+
+// CREATE SUGGESTION
+app.post('/api/suggestions', (req, res) => {
+  const {
+    customerName,
+    foodName,
+    category,
+    reason,
+  } = req.body;
+
+  const suggestions =
+    getSuggestions();
+
+  const newIdea = {
+    id: 'sug-' + Date.now(),
+    customerName:
+      customerName || 'Anonymous',
     foodName,
     category,
     reason,
     status: 'pending',
-    createdAt: new Date().toISOString()
+    createdAt:
+      new Date().toISOString(),
   };
 
-  suggestions.push(newSuggestion);
-  writeData(SUGGESTIONS_FILE, suggestions);
-  res.status(201).json({ message: "Suggestion submitted!", suggestion: newSuggestion });
+  suggestions.unshift(newIdea);
+
+  saveSuggestions(suggestions);
+
+  res.json({
+    suggestion: newIdea,
+  });
 });
 
-app.get('/api/suggestions', requireStaff, (req, res) => {
-  res.json({ suggestions: readData(SUGGESTIONS_FILE) });
+// UPDATE SUGGESTION
+app.patch(
+  '/api/suggestions/:id',
+  authStaff,
+  (req, res) => {
+    const { status } = req.body;
+
+    const suggestions =
+      getSuggestions();
+
+    const sug = suggestions.find(
+      (s) => s.id === req.params.id
+    );
+
+    if (sug) {
+      sug.status = status;
+      saveSuggestions(suggestions);
+    }
+
+    res.json({
+      suggestion: sug,
+    });
+  }
+);
+
+// NOTIFICATIONS
+app.get('/api/notifications', (req, res) => {
+  res.json({
+    notifications:
+      getNotifications(),
+  });
 });
 
-app.patch('/api/suggestions/:id', requireStaff, (req, res) => {
-  const suggestions = readData(SUGGESTIONS_FILE);
-  const index = suggestions.findIndex((suggestion) => suggestion.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: 'Suggestion not found' });
-  suggestions[index].status = req.body.status || suggestions[index].status;
-  writeData(SUGGESTIONS_FILE, suggestions);
-  const suggestion = suggestions[index];
-  if (suggestion.status === 'planned' || suggestion.status === 'approved') pushNotification('all', 'New canteen idea', `${suggestion.foodName} was added to the canteen ideas list.`, 'suggestion');
-  res.json({ suggestion });
-});
+// FALLBACK ROUTES
 
-// Unknown API paths must answer with JSON, not the student page.
-app.use('/api', (req, res) => res.status(404).json({ error: 'API route not found' }));
-
-// ==========================================
-// PAGE ROUTING HANDLERS
-// ==========================================
-
-// Staff Board Page Route
 app.get('/staff', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'staff.html'));
+  res.sendFile(
+    path.join(
+      __dirname,
+      'public',
+      'staff.html'
+    )
+  );
 });
 
-// Default Student App Fallback Route
-app.get('/{*splat}', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+app.use((req, res) => {
+  res.sendFile(
+    path.join(
+      __dirname,
+      'public',
+      'index.html'
+    )
+  );
 });
 
-// Any unexpected error becomes a JSON message (and a line in the server logs) instead of an HTML error page.
-app.use((err, req, res, next) => {
-  console.error('[error]', req.method, req.originalUrl, err);
-  if (res.headersSent) return next(err);
-  const status = err.status && err.status < 500 ? err.status : 500;
-  res.status(status).json({ error: status < 500 ? err.message : 'Server error. Please try again.' });
+// START SERVER
+const server = app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`);
+
+  if (!EMAIL_CONFIGURED) {
+    console.warn(
+      '[EMAIL] Gmail sending is NOT configured. Create a .env file with EMAIL_USER and EMAIL_PASS.'
+    );
+    return;
+  }
+
+  transporter.verify()
+    .then(() => {
+      console.log(
+        `[EMAIL] Gmail transporter is ready. Sender: ${EMAIL_USER}`
+      );
+    })
+    .catch((err) => {
+      console.error(
+        '[EMAIL] Gmail transporter verification failed:',
+        err.message
+      );
+    });
 });
 
-// Start Server
-app.listen(PORT, () => {
-  if (STAFF_PIN === '1234') {
-    console.warn('[warn] Using the default staff PIN (1234). Set the STAFF_PIN environment variable before deploying.');
-  }
-  if (STAFF_INVITE_CODE === '2006') {
-    console.warn('[warn] Using the default staff verification code. Set STAFF_INVITE_CODE before deploying.');
-  }
-  if (!MAIL_ENABLED) {
-    console.warn('[warn] Email is NOT configured. Set BREVO_API_KEY and MAIL_FROM so verification and reset codes are emailed. Until then, codes are only printed in these logs.');
-  } else {
-    console.log(`[info] Email enabled via Brevo (from ${MAIL_FROM}).`);
-  }
-  console.log(`Campus Pickup is running:`);
-  console.log(`  Student app : http://localhost:${PORT}`);
-  console.log(`  Staff board : http://localhost:${PORT}/staff`);
-  console.log(`  Data folder : ${DATA_DIR}`);
-  console.log(`  Uploads     : ${UPLOAD_DIR}`);
+server.on('error', (err) => {
+  console.error('[SERVER ERROR]', err);
+});
+
+server.on('close', () => {
+  console.error('[SERVER] The HTTP server was closed.');
+});
+
+process.on('exit', (code) => {
+  console.log(`[PROCESS] Node process is exiting with code ${code}`);
+});
+
+process.on('SIGINT', () => {
+  console.log('[PROCESS] SIGINT received.');
+});
+
+process.on('SIGTERM', () => {
+  console.log('[PROCESS] SIGTERM received.');
 });

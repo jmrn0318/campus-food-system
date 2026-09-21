@@ -16,5 +16,33 @@
     "salt": "5fe007ad30ff31c3b0068a9d05726815",
     "passwordHash": "add25ba63f208193cb1fca1e00ef02a54dead05ad19413737621654ced934b14242e965756ee08da9ebec1ea40cd6008b6d3a36e60dd6889bf3104aa3afe30c0",
     "createdAt": "2026-09-20T12:04:13.781Z"
+  },
+  {
+    "id": "customer-1789957565229",
+    "name": "chelzy",
+    "email": "marikacindyy@gmail.com",
+    "role": "customer",
+    "salt": "a76571c6d86a044b18ffdb4f04d7ca9e",
+    "passwordHash": "17135204cc9afc2ffb65a32ba116e70b0008231ab47c6eb2a1536bacd931c9e063e29b48b06cede243d9cbea0b36a9ca24cde2ad65240d780b0ffde325d08b31",
+    "emailVerified": true,
+    "createdAt": "2026-09-21T02:26:05.230Z"
+  },
+  {
+    "id": "usr-1789960435196",
+    "name": "Bogart",
+    "email": "jietowejok@gmail.com",
+    "salt": "2bf4be282e979ca338446d1d2b165294",
+    "hash": "60a1b386ebe9ffc0f4ffd15c2c1253096cb711992336f864751b91cb2ccd60d56935fbc434869cd683af3953f2a308e8ac7f96281c10829331ea201d0856e4f1",
+    "role": "customer",
+    "createdAt": "2026-09-21T03:13:55.199Z"
+  },
+  {
+    "id": "usr-1789965741902",
+    "name": "Kise Sy",
+    "email": "inoah1446@gmail.com",
+    "salt": "99221d16eccb5c7b21668d9b2058518c",
+    "hash": "d40c3843047ff7e82be600b07e8173bf7d16dafec5bb50f037ffc76068b3044c41bf65c14d5356c4ce31ceb2b479e50fee3b618a376193b1b3c3c9414e2cc45f",
+    "role": "customer",
+    "createdAt": "2026-09-21T04:42:21.903Z"
   }
 ]
