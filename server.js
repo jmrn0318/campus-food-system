@@ -1,5 +1,8 @@
 const path = require('path');
 const fs = require('fs');
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
