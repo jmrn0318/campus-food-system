@@ -6,7 +6,6 @@ dns.setDefaultResultOrder('ipv4first');
 const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -17,46 +16,59 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const STAFF_PIN = process.env.STAFF_PIN || '1234';
 const STAFF_INVITE_CODE = process.env.STAFF_INVITE_CODE || '2006';
 
-// Gmail Transporter Setup (Nodemailer)
-const EMAIL_USER = String(process.env.EMAIL_USER || '').trim();
-const EMAIL_PASS = String(process.env.EMAIL_PASS || '').replace(/\s+/g, '').trim();
-const EMAIL_CONFIGURED = Boolean(EMAIL_USER && EMAIL_PASS);
+// Nylas Email Setup
+const NYLAS_API_KEY = String(process.env.NYLAS_API_KEY || '').trim();
+const NYLAS_GRANT_ID = String(process.env.NYLAS_GRANT_ID || '').trim();
 
-const transporter = EMAIL_CONFIGURED
-  ? nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: EMAIL_USER,
-        pass: EMAIL_PASS,
-      },
-    })
-  : null;
+const EMAIL_CONFIGURED = Boolean(
+  NYLAS_API_KEY && NYLAS_GRANT_ID
+);
 
-// Helper Function para magpadala ng Verification Code sa Gmail App
-async function sendVerificationEmail(toEmail, code, subjectTitle = 'Your Verification Code') {
-  if (!EMAIL_CONFIGURED || !transporter) {
-    throw new Error('Gmail email sending is not configured. Check EMAIL_USER and EMAIL_PASS in .env.');
+// Helper Function para magpadala ng Verification Code
+async function sendVerificationEmail(
+  toEmail,
+  code,
+  subjectTitle = 'Your Verification Code'
+) {
+  if (!EMAIL_CONFIGURED) {
+    throw new Error(
+      'Nylas email sending is not configured. Check NYLAS_API_KEY and NYLAS_GRANT_ID in .env.'
+    );
   }
 
-  const mailOptions = {
-    from: `"Campus Pickup" <${EMAIL_USER}>`,
-    to: toEmail,
-    subject: `${subjectTitle} - Campus Pickup`,
-    text: `Your Campus Pickup verification code is ${code}. This code expires in 10 minutes.`,
-    html: `
-      <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #e0e2ee; border-radius: 10px; max-width: 500px; margin: 0 auto;">
-        <h2 style="color: #1F1B4D; margin-bottom: 10px;">Campus Pickup</h2>
-        <p style="color: #5b5f7a; font-size: 16px;">Gawin ang hakbang na ito para ma-verify ang iyong account:</p>
-        <div style="background: #f4f5fa; padding: 15px; text-align: center; border-radius: 8px; margin: 20px 0;">
-          <h1 style="color: #0e7c45; letter-spacing: 6px; font-size: 32px; margin: 0;">${code}</h1>
-        </div>
-        <p style="color: #8b8fa8; font-size: 14px;">Ang code na ito ay mag-e-expire sa loob ng 10 minuto. Huwag ipagkaloob kanino man.</p>
-      </div>
-    `,
-  };
+  const response = await fetch(
+    `https://api.us.nylas.com/v3/grants/${NYLAS_GRANT_ID}/messages/send`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${NYLAS_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        subject: `${subjectTitle} - Campus Pickup`,
+        body: `Your Campus Pickup verification code is ${code}. This code expires in 10 minutes.`,
+        to: [
+          {
+            email: toEmail
+          }
+        ]
+      })
+    }
+  );
 
-  const info = await transporter.sendMail(mailOptions);
-  console.log(`[EMAIL] Verification email sent to ${toEmail}. Message ID: ${info.messageId}`);
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      result?.message ||
+      result?.error?.message ||
+      `Nylas failed to send the email. HTTP ${response.status}`
+    );
+  }
+
+  console.log(
+    `[EMAIL] Verification email sent to ${toEmail}. Message ID: ${result?.data?.id || 'unknown'}`
+  );
 }
 
 app.use(express.json());
@@ -1338,23 +1350,11 @@ const server = app.listen(PORT, () => {
 
   if (!EMAIL_CONFIGURED) {
     console.warn(
-      '[EMAIL] Gmail sending is NOT configured. Create a .env file with EMAIL_USER and EMAIL_PASS.'
+      '[EMAIL] Nylas is NOT configured. Check NYLAS_API_KEY and NYLAS_GRANT_ID in .env.'
     );
-    return;
+  } else {
+    console.log('[EMAIL] Nylas is configured and ready.');
   }
-
-  transporter.verify()
-    .then(() => {
-      console.log(
-        `[EMAIL] Gmail transporter is ready. Sender: ${EMAIL_USER}`
-      );
-    })
-    .catch((err) => {
-      console.error(
-        '[EMAIL] Gmail transporter verification failed:',
-        err.message
-      );
-    });
 });
 
 server.on('error', (err) => {
