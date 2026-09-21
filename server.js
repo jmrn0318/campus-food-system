@@ -9,8 +9,14 @@ const PORT = process.env.PORT || 3000;
 const STAFF_PIN = process.env.STAFF_PIN || '1234';
 const STAFF_INVITE_CODE = process.env.STAFF_INVITE_CODE || '2006';
 
-// Data directory path
-const DATA_DIR = path.join(__dirname, 'data');
+// Data directory path. On a host with a persistent volume, set DATA_DIR to its mount path (e.g. /data).
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
+// Uploaded food photos live inside DATA_DIR when it is set, so they survive redeploys too.
+const UPLOAD_DIR = process.env.UPLOAD_DIR
+  ? path.resolve(process.env.UPLOAD_DIR)
+  : process.env.DATA_DIR
+    ? path.join(DATA_DIR, 'uploads')
+    : path.join(__dirname, 'public', 'uploads');
 const MENU_FILE = path.join(DATA_DIR, 'menu.json');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 const SUGGESTIONS_FILE = path.join(DATA_DIR, 'suggestions.json');
@@ -18,24 +24,51 @@ const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const NOTIFICATIONS_FILE = path.join(DATA_DIR, 'notifications.json');
 const sessions = new Map();
 
+// Fresh deploys start with no data folder and no menu.json (both are git-ignored), so create them here.
+const SEED_CANDIDATES = [
+  path.join(__dirname, 'data', 'menu.seed.json'),
+  path.join(__dirname, 'data', 'menu_seed.json'),
+  path.join(__dirname, 'menu.seed.json'),
+  path.join(__dirname, 'menu_seed.json')
+];
+const ensureDataFiles = () => {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  [ORDERS_FILE, SUGGESTIONS_FILE, USERS_FILE, NOTIFICATIONS_FILE].forEach((file) => {
+    if (!fs.existsSync(file)) fs.writeFileSync(file, '[]');
+  });
+  if (!fs.existsSync(MENU_FILE)) {
+    const seed = SEED_CANDIDATES.find((file) => fs.existsSync(file));
+    if (seed) {
+      fs.copyFileSync(seed, MENU_FILE);
+      console.log(`[info] Menu created from ${seed}`);
+    } else {
+      fs.writeFileSync(MENU_FILE, '[]');
+      console.warn('[warn] No menu seed file found, so the menu starts empty.');
+    }
+  }
+};
+ensureDataFiles();
+
 // Middleware
 app.use(express.json());
+app.use((req, res, next) => {
+  if (req.body === undefined) req.body = {};
+  next();
+});
 
 // 1. DITO ANG ARAW NG SOLUSYON: I-serve ang 'public' folder
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // Storage setup para sa Image Uploads ng Staff
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, 'public/uploads');
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    cb(null, UPLOAD_DIR);
   },
   filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
+    cb(null, `${Date.now()}-${file.originalname.replace(/[^\w.\-]+/g, '_')}`);
   }
 });
 const upload = multer({ storage });
@@ -47,7 +80,10 @@ const readData = (filePath) => {
 };
 
 const writeData = (filePath, data) => {
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, filePath);
 };
 
 const hashPassword = (password, salt = crypto.randomBytes(16).toString('hex')) => ({
@@ -114,9 +150,9 @@ const publicUser = (user) => ({ id: user.id, name: user.name, email: user.email,
 const registerUser = (name, email, password, role) => {
   const users = readData(USERS_FILE);
   const normalizedEmail = String(email || '').toLowerCase().trim();
-  if (!name || !normalizedEmail || !password || password.length < 6) return { error: 'Name, email, and a password of at least 6 characters are required.' };
+  if (!name || !normalizedEmail || !password || String(password).length < 6) return { error: 'Name, email, and a password of at least 6 characters are required.' };
   if (users.some((user) => user.email === normalizedEmail)) return { error: 'An account with that email already exists.', status: 409 };
-  const credentials = hashPassword(password);
+  const credentials = hashPassword(String(password));
   const user = { id: `${role}-${Date.now()}`, name: String(name).trim(), email: normalizedEmail, role, ...credentials, createdAt: new Date().toISOString() };
   users.push(user);
   writeData(USERS_FILE, users);
@@ -130,7 +166,7 @@ const loginUser = (email, password, role) => {
 };
 
 app.post('/api/auth/staff/register', (req, res) => {
-  if (req.body.inviteCode !== STAFF_INVITE_CODE) return res.status(403).json({ error: 'Valid staff verification code required.' });
+  if (String(req.body.inviteCode || '').trim() !== STAFF_INVITE_CODE) return res.status(403).json({ error: 'Valid staff verification code required.' });
   const result = registerUser(req.body.name, req.body.email, req.body.password, 'staff');
   if (result.error) return res.status(result.status || 400).json({ error: result.error });
   res.status(201).json({ token: result.token, user: publicUser(result.user) });
@@ -211,11 +247,12 @@ const pushNotification = (recipient, title, message, type = 'info') => {
 
 app.post('/api/auth/register', (req, res) => {
   const { name, email, password } = req.body;
-  if (!name || !email || !password || password.length < 6) return res.status(400).json({ error: 'Name, email, and a password of at least 6 characters are required.' });
+  const normalizedEmail = String(email || '').toLowerCase().trim();
+  if (!name || !normalizedEmail || !password || String(password).length < 6) return res.status(400).json({ error: 'Name, email, and a password of at least 6 characters are required.' });
   const users = readData(USERS_FILE);
-  if (users.some((user) => user.email === email.toLowerCase())) return res.status(409).json({ error: 'An account with that email already exists.' });
-  const credentials = hashPassword(password);
-  const user = { id: `user-${Date.now()}`, name: name.trim(), email: email.toLowerCase().trim(), role: 'customer', ...credentials, createdAt: new Date().toISOString() };
+  if (users.some((user) => user.email === normalizedEmail)) return res.status(409).json({ error: 'An account with that email already exists.' });
+  const credentials = hashPassword(String(password));
+  const user = { id: `user-${Date.now()}`, name: String(name).trim(), email: normalizedEmail, role: 'customer', ...credentials, createdAt: new Date().toISOString() };
   users.push(user);
   writeData(USERS_FILE, users);
   const token = tokenFor(user);
@@ -426,6 +463,9 @@ app.patch('/api/suggestions/:id', requireStaff, (req, res) => {
   res.json({ suggestion });
 });
 
+// Unknown API paths must answer with JSON, not the student page.
+app.use('/api', (req, res) => res.status(404).json({ error: 'API route not found' }));
+
 // ==========================================
 // PAGE ROUTING HANDLERS
 // ==========================================
@@ -440,6 +480,14 @@ app.get('/{*splat}', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// Any unexpected error becomes a JSON message (and a line in the server logs) instead of an HTML error page.
+app.use((err, req, res, next) => {
+  console.error('[error]', req.method, req.originalUrl, err);
+  if (res.headersSent) return next(err);
+  const status = err.status && err.status < 500 ? err.status : 500;
+  res.status(status).json({ error: status < 500 ? err.message : 'Server error. Please try again.' });
+});
+
 // Start Server
 app.listen(PORT, () => {
   if (STAFF_PIN === '1234') {
@@ -452,4 +500,5 @@ app.listen(PORT, () => {
   console.log(`  Student app : http://localhost:${PORT}`);
   console.log(`  Staff board : http://localhost:${PORT}/staff`);
   console.log(`  Data folder : ${DATA_DIR}`);
+  console.log(`  Uploads     : ${UPLOAD_DIR}`);
 });
